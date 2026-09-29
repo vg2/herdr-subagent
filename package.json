@@ -1,0 +1,35 @@
+{
+  "name": "herdr-subagent",
+  "version": "0.1.0",
+  "description": "Pi extension for visible, isolated sub-agents using Herdr",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "herdr",
+    "subagents"
+  ],
+  "author": "Vishen Gounden <vgounden@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vg2/herdr-subagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vg2/herdr-subagent/issues"
+  },
+  "homepage": "https://github.com/vg2/herdr-subagent#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
