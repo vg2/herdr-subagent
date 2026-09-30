@@ -494,10 +494,124 @@ test("reconcileRuns fails a stale running headless child and leaves settled runs
 
 	assert.deepStrictEqual(summary.settled, [running.id]);
 	assert.strictEqual(running.status, "failed");
+	assert.ok(running.abandoned, "a headless child that never wrote a final report is abandoned mid-flight");
 	assert.ok(running.errorMessage?.includes("could not be adopted"));
 	assert.ok(running.report.includes("could not be adopted"));
 	assert.strictEqual(settled.status, "done", "already-settled runs keep their status");
 	assert.deepStrictEqual(changed.map((r) => r.id), [running.id]);
+});
+
+test("reconcileRuns marks a headless child that wrote its final report as done, not failed", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-reconcile-finished-"));
+	const reportPath = path.join(tmpDir, "report.md");
+	fs.writeFileSync(reportPath, "Final report written before the crash");
+	const run = makeRun({ id: "sa-test-reconcile-finished", status: "running", mode: "headless", dir: tmpDir, reportPath });
+	run.agentName = undefined;
+	run.paneId = undefined;
+
+	const summary = await reconcileRuns({ runs: [run], liveAgents: [], paneAlive: async () => false });
+
+	assert.strictEqual(run.status, "done", "a child that wrote its final report finished cleanly");
+	assert.strictEqual(run.abandoned, undefined);
+	assert.strictEqual(run.report, "Final report written before the crash");
+	assert.deepStrictEqual(summary.settled, [run.id]);
+});
+
+test("reconcileRuns re-adopts a live agent by pane id when the persisted name no longer matches", async () => {
+	const run = makeRun({ id: "sa-test-reconcile-pane", status: "running", paneId: "%5", agentName: "sa-old-name" });
+	const summary = await reconcileRuns({
+		runs: [run],
+		liveAgents: [
+			{
+				agent: "reassigned-agent",
+				name: "sa-new-name",
+				agent_status: "working",
+				pane_id: "%5",
+				tab_id: "tab-1",
+				workspace_id: "ws-1",
+			},
+		],
+		paneAlive: async () => true,
+	});
+
+	assert.deepStrictEqual(summary.adopted, [run.id]);
+	assert.strictEqual(run.agentName, "sa-new-name", "tracking resumes under the live agent's current name");
+	assert.strictEqual(run.paneId, "%5");
+	assert.strictEqual(run.paneClosed, false);
+	assert.strictEqual(run.status, "running");
+	assert.strictEqual(typeof run.abort, "function");
+});
+
+test("reconcileRuns never persists mid-flight session text for an abandoned pane child", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-reconcile-midflight-"));
+	const reportPath = path.join(tmpDir, "report.md");
+	const sessionId = "reconcile-midflight-uuid";
+	const run = makeRun({
+		id: "sa-test-reconcile-midflight",
+		status: "blocked",
+		paneId: "%6",
+		agentName: "sa-test-reconcile-midflight",
+		sessionId,
+		dir: tmpDir,
+		reportPath,
+	});
+
+	const baseDir = path.join(getAgentDir(), "sessions");
+	const slug = "--" + path.resolve(run.cwd).replace(/^[\/\\]+/, "").replace(/[\\/:]/g, "-") + "--";
+	const groupDir = path.join(baseDir, slug);
+	fs.mkdirSync(groupDir, { recursive: true });
+	const sessionFile = path.join(groupDir, `2026-09-30T00-00-00-000Z_${sessionId}.jsonl`);
+	fs.writeFileSync(
+		sessionFile,
+		[
+			JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: run.cwd }),
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Approve this edit?" }],
+					usage: { input: 10, output: 5, cost: { total: 0.0001 }, totalTokens: 15 },
+				},
+			}),
+		].join("\n"),
+		"utf-8",
+	);
+
+	try {
+		// Pane is gone: the child died blocked mid-flight, its pending question must
+		// stay display-only and never be persisted as its final report.
+		const deadPane = await reconcileRuns({ runs: [run], liveAgents: [], paneAlive: async () => false });
+
+		assert.strictEqual(run.status, "failed");
+		assert.ok(run.abandoned);
+		assert.ok(run.errorMessage?.includes("mid-flight"), run.errorMessage);
+		assert.ok(run.report.includes("Approve this edit?"), "the question remains visible as display text");
+		assert.strictEqual(fs.existsSync(reportPath), false, "mid-flight text must not be persisted to reportPath");
+		assert.deepStrictEqual(deadPane.settled, [run.id]);
+		assert.deepStrictEqual(deadPane.orphaned, []);
+
+		// Pane still alive but no agent owns it: surfaced as orphaned, not silently done.
+		const run2 = makeRun({
+			id: "sa-test-reconcile-orphan",
+			status: "blocked",
+			paneId: "%7",
+			agentName: "sa-test-reconcile-orphan",
+			sessionId,
+			dir: tmpDir,
+			reportPath: path.join(tmpDir, "report-orphan.md"),
+		});
+		const livePane = await reconcileRuns({ runs: [run2], liveAgents: [], paneAlive: async () => true });
+
+		assert.strictEqual(run2.status, "failed");
+		assert.ok(run2.abandoned);
+		assert.ok(run2.errorMessage?.includes("alive but no live Herdr agent"), run2.errorMessage);
+		assert.strictEqual(run2.paneClosed, false);
+		assert.strictEqual(fs.existsSync(run2.reportPath), false);
+		assert.deepStrictEqual(livePane.orphaned, [run2.id]);
+	} finally {
+		if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
 });
 
 test("reconcileRuns adopts a live working agent and resumes tracking", async () => {

@@ -455,10 +455,16 @@ reconstructed on `session_start` from the branch (`ctx.sessionManager.getBranch(
   on the active branch (newest snapshot wins; cumulative usage only moves
   forward; reports survive entries that lack one). On `startup`/`resume`/
   `reload` (never `new`/`fork`), `reconcileRuns()` matches persisted pane
-  runs against `herdr agent list`: live agents are re-adopted with a fresh
-  abort handle and live pane ids, runs with no live process are settled from
-  their persisted report/session, and stale running headless children are
-  failed. The live pane/agent identity is now persisted right after
+  runs against `herdr agent list` — by agent name first, then by pane id
+  (names can be reassigned after a herdr restart; the pane is the run's
+  durable identity): live agents are re-adopted with a fresh abort handle
+  and live pane ids. Runs with no live agent are settled: a child that wrote
+  its final report to disk finished cleanly, anything else died mid-flight
+  and is failed with an `abandoned` marker so its harvested text is
+  display-only and never persisted as a final report; a child abandoned in
+  a live but untracked pane is surfaced as orphaned in the restore
+  notification instead of silently dropped. Stale running headless children
+  are failed the same way. The live pane/agent identity is now persisted right after
   `agent start`, so a crashed parent can adopt the child at all; owned
   source workspaces are re-registered for later worktree runs, and a
   bounded window (most recent 100 runs) keeps restores finite.)*

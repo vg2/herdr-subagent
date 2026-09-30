@@ -215,7 +215,9 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 			if (sessionData) {
 				if (!report && sessionData.lastAssistantText) {
 					report = sessionData.lastAssistantText.trim();
-					isGenuineReport = true;
+					// A run abandoned at restore may have died mid-turn: its session text
+					// is display-only, never a persisted final report.
+					isGenuineReport = run.abandoned !== true;
 				}
 				// A pane child's session JSONL is the cumulative usage source of truth.
 				// Re-read it on every harvest so a blocked run that resumes (and then
@@ -435,23 +437,64 @@ export interface ReconcileOptions {
 	paneAlive?: (paneId: string) => Promise<boolean>;
 }
 
+/** Whether the child wrote a final report to its scratch directory before dying. */
+function hasDiskReport(run: SubagentRun): boolean {
+	try {
+		return fs.existsSync(run.reportPath) && fs.readFileSync(run.reportPath, "utf-8").trim().length > 0;
+	} catch {
+		return false;
+	}
+}
+
 export interface ReconcileSummary {
 	restored: number;
 	/** Runs with a matching live herdr agent, re-adopted and tracked again. */
 	adopted: string[];
 	/** Runs transitioned to a final status because no live process backs them. */
 	settled: string[];
+	/** Runs settled mid-flight in a pane that is still alive but untrackable (no live agent owns it). */
+	orphaned: string[];
+}
+
+/**
+ * Settle a mid-flight run whose process can no longer be tracked: the child
+ * wrote its final report to disk before the parent restart (finished) or died
+ * mid-flight (marked `abandoned` — its harvested text is display-only and is
+ * never persisted as a final report). A pane that is still alive but no longer
+ * owned by any live agent is surfaced as orphaned instead of silently dropped.
+ */
+async function settleMidFlight(
+	run: SubagentRun,
+	paneLive: boolean,
+	summary: Pick<ReconcileSummary, "orphaned" | "settled">,
+): Promise<void> {
+	const finished = hasDiskReport(run);
+	if (!finished) {
+		run.abandoned = true;
+		run.errorMessage ??= paneLive
+			? `Abandoned at restore: pane ${run.paneId} is alive but no live Herdr agent tracks this child; the report may be mid-flight.`
+			: `Abandoned at restore: the child was still ${run.status} and its pane is gone; the report may be mid-flight.`;
+	}
+	run.status = finished ? "done" : "failed";
+	run.endedAt ??= Date.now();
+	if (!finished && paneLive) summary.orphaned.push(run.id);
+	await harvestReport(run);
+	summary.settled.push(run.id);
 }
 
 /**
  * Reconcile runs reconstructed from the session branch against live Herdr
  * agents. Live pane children are re-adopted (with a fresh abort handle) so the
- * poller keeps tracking them; runs with no live agent are settled from their
- * persisted report/session, and stale headless runs are marked failed.
+ * poller keeps tracking them — matched by agent name first, then by pane id
+ * (agent names can be reassigned after a herdr restart; the pane is the run's
+ * durable identity). Runs with no live agent are settled: a child that wrote
+ * its final report to disk finished cleanly; anything else died mid-flight,
+ * is marked `abandoned` and failed, and one abandoned in a live untracked pane
+ * is surfaced as orphaned. Stale headless runs are failed the same way.
  */
 export async function reconcileRuns(options: ReconcileOptions): Promise<ReconcileSummary> {
 	const { runs, onChange, paneAlive } = options;
-	const summary: ReconcileSummary = { restored: runs.length, adopted: [], settled: [] };
+	const summary: ReconcileSummary = { restored: runs.length, adopted: [], settled: [], orphaned: [] };
 	if (runs.length === 0) return summary;
 
 	const herdrReady = isHerdrAvailable();
@@ -464,6 +507,11 @@ export async function reconcileRuns(options: ReconcileOptions): Promise<Reconcil
 		live = new Map();
 	}
 
+	const liveByPane = new Map<string, HerdrAgent>();
+	for (const agent of live.values()) {
+		if (agent.pane_id) liveByPane.set(agent.pane_id, agent);
+	}
+
 	const probePane = paneAlive ?? (herdrReady ? isPaneAlive : async () => false);
 
 	for (const run of runs) {
@@ -472,8 +520,14 @@ export async function reconcileRuns(options: ReconcileOptions): Promise<Reconcil
 		if (run.mode === "headless") {
 			// A headless child is a child of the old parent process: nothing to adopt.
 			if (run.status === "running") {
-				run.status = "failed";
-				run.errorMessage ??= "Parent session ended while this headless child was running; the process could not be adopted.";
+				const finished = hasDiskReport(run);
+				if (!finished) {
+					run.abandoned = true;
+					run.errorMessage ??=
+						"Parent session ended while this headless child was running; the process could not be adopted. " +
+						"The report may be mid-flight.";
+				}
+				run.status = finished ? "done" : "failed";
 				run.endedAt ??= Date.now();
 				await harvestReport(run);
 				summary.settled.push(run.id);
@@ -482,11 +536,19 @@ export async function reconcileRuns(options: ReconcileOptions): Promise<Reconcil
 			continue;
 		}
 
-		const agent = run.agentName ? live.get(run.agentName) : undefined;
+		let agent = run.agentName ? live.get(run.agentName) : undefined;
+		if (!agent && run.paneId) {
+			// The agent name no longer matches (e.g. reassigned after a herdr
+			// restart) but the pane is the run's durable identity: adopt whichever
+			// live agent now owns that pane and keep tracking it by its current name.
+			agent = liveByPane.get(run.paneId);
+		}
 		if (agent) {
 			run.paneClosed = false;
 			if (agent.pane_id) run.paneId = agent.pane_id;
 			if (agent.tab_id) run.tabId = agent.tab_id;
+			const liveName = agent.name || agent.agent;
+			if (liveName && run.agentName !== liveName) run.agentName = liveName;
 			run.abort = restoredPaneAbort(run);
 			run.status = statusFromHerdr(agent.agent_status, run.status);
 			if (run.status === "running") {
@@ -497,12 +559,10 @@ export async function reconcileRuns(options: ReconcileOptions): Promise<Reconcil
 			if (run.status !== "running") await harvestReport(run);
 			summary.adopted.push(run.id);
 		} else {
-			run.paneClosed = run.paneId ? !(await probePane(run.paneId)) : true;
+			const paneLive = run.paneId ? await probePane(run.paneId) : false;
+			run.paneClosed = !paneLive;
 			if (!isSettled(run.status)) {
-				run.status = "done";
-				run.endedAt ??= Date.now();
-				await harvestReport(run);
-				summary.settled.push(run.id);
+				await settleMidFlight(run, paneLive, summary);
 			}
 		}
 

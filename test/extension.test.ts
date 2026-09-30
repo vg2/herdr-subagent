@@ -189,7 +189,7 @@ test("session_start restores children from the session branch, settles stale run
 				agent: "reviewer",
 				status: "blocked",
 				mode: "pane",
-				paneId: "%42",
+				paneId: "%942",
 				agentName: "sa-reviewer-987656",
 				blockedQuestion: "Approve this edit?",
 				endedAt: undefined,
@@ -220,8 +220,14 @@ test("session_start restores children from the session branch, settles stale run
 	assert.strictEqual(stale.status, "failed", "stale headless runs cannot be adopted");
 
 	const blocked = runs.find((r: any) => r.id === "sa-reviewer-987656");
-	assert.strictEqual(blocked.status, "done", "a blocked child with no live agent is settled");
+	assert.strictEqual(blocked.status, "failed", "a mid-flight child with no live agent and no final report is failed");
 	assert.strictEqual(blocked.paneClosed, true);
+	assert.ok(blocked.errorMessage?.includes("mid-flight"), blocked.errorMessage);
+	assert.strictEqual(
+		fs.existsSync(blocked.reportPath),
+		false,
+		"a pending question must never be persisted to the child's reportPath",
+	);
 
 	assert.ok(statusRes.content[0].text.includes("Totals:"), statusRes.content[0].text);
 });

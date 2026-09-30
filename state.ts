@@ -62,6 +62,13 @@ export interface SubagentRun {
 	 * harvested from its session (display-only, never persisted as a report).
 	 */
 	blockedQuestion?: string;
+	/**
+	 * Set when reconciliation settles a run that died mid-flight (no live
+	 * process backs it and no final report was written). Any harvested text for
+	 * such a run is display-only: it must never be persisted as a final report.
+	 * Internal only — not part of the durable RunView snapshot.
+	 */
+	abandoned?: boolean;
 	messages: Message[];
 	usage: UsageStats;
 	stderr: string;

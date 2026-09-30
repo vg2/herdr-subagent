@@ -590,6 +590,12 @@ export default function (pi: ExtensionAPI) {
 				const parts = [`Restored ${summary.restored} sub-agent${summary.restored === 1 ? "" : "s"} from the previous session`];
 				if (summary.adopted.length > 0) parts.push(`${summary.adopted.length} re-adopted`);
 				if (summary.settled.length > 0) parts.push(`${summary.settled.length} settled`);
+				if (summary.orphaned.length > 0) {
+					parts.push(
+					`${summary.orphaned.length} abandoned mid-flight in live but untracked pane${summary.orphaned.length === 1 ? "" : "s"} ` +
+					`(see their panes directly)`,
+				);
+			}
 				ctx.ui.notify(`${parts.join("; ")}.`, "info");
 			}
 		} catch {
