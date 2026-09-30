@@ -262,6 +262,18 @@ export function forgetSourceWorkspace(workspaceId: string): void {
 	}
 }
 
+/**
+ * Re-register a source workspace recorded in the session, so a resumed parent
+ * session reuses it for later worktree runs instead of opening a duplicate.
+ * Live entries win: adoption never replaces an in-flight creation.
+ */
+export function adoptSourceWorkspace(repoRoot: string, owned: SourceWorkspace): void {
+	if (!owned?.workspaceId) return;
+	const key = path.resolve(repoRoot);
+	if (sourceWorkspaces.has(key)) return;
+	sourceWorkspaces.set(key, { promise: Promise.resolve(owned), workspaceId: owned.workspaceId });
+}
+
 /** Whether a workspace still exists per herdr (unknown errors conservatively say yes). */
 async function sourceWorkspaceAlive(workspaceId: string): Promise<boolean> {
 	try {

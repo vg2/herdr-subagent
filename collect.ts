@@ -15,19 +15,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
+	closePane,
 	getAgent,
 	isHerdrAvailable,
+	isPaneAlive,
+	listAgents,
 	readAgent,
+	sendKeys,
 	showNotification,
 	waitAgent,
+	type HerdrAgent,
 } from "./herdr.ts";
 import {
 	isSettled,
-	type RunRegistry,
+	type RunStatus,
 	type SubagentRun,
 	type UsageStats,
 	wrapUntrustedReport,
 } from "./state.ts";
+import { firstLine } from "./format.ts";
 
 /**
  * Locate a pi session file by cwd and sessionId.
@@ -162,6 +168,21 @@ export function parseSessionJsonl(filePath: string): HarvestedSessionData | null
 }
 
 /**
+ * Human-readable pending prompt for a blocked child. Kept display-only: a
+ * blocked run may resume, so this must never be persisted as its report.
+ */
+export function extractBlockedQuestion(text: string | undefined | null, limit = 500): string | undefined {
+	if (!text) return undefined;
+	const collapsed = text
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.join("\n");
+	if (!collapsed || collapsed === "(no output)") return undefined;
+	return collapsed.length > limit ? `${collapsed.slice(0, limit - 1)}…` : collapsed;
+}
+
+/**
  * Harvest final report and usage stats for a run (headless or pane).
  */
 export async function harvestReport(run: SubagentRun): Promise<void> {
@@ -196,8 +217,11 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 					report = sessionData.lastAssistantText.trim();
 					isGenuineReport = true;
 				}
-				// Merge usage stats if run didn't already have them
-				if (sessionData.usage.turns > 0 && run.usage.turns === 0) {
+				// A pane child's session JSONL is the cumulative usage source of truth.
+				// Re-read it on every harvest so a blocked run that resumes (and then
+				// finishes) reports its full totals, not the partial snapshot taken when
+				// it first blocked.
+				if (sessionData.usage.turns > 0 && sessionData.usage.turns >= run.usage.turns) {
 					run.usage = sessionData.usage;
 				}
 				if (!run.model && sessionData.model) run.model = sessionData.model;
@@ -221,9 +245,11 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 		}
 	}
 
-	// 4. Fallback: error message or placeholder
+	// 4. Fallback: a report already known (e.g. restored from the session branch) or
+	// the error output. Restored runs may have lost their scratch report file when
+	// the previous parent session cleaned up, so never clobber their known report.
 	if (!report) {
-		report = run.errorMessage || run.stderr.trim() || "(no output)";
+		report = run.report?.trim() || run.errorMessage || run.stderr.trim() || "(no output)";
 	}
 
 	// Persisting a report is only safe once the child can no longer change it.
@@ -245,6 +271,10 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 
 	run.report = report;
 
+	// Blocked runs are waiting on input, not finished: keep the pending prompt in
+	// its own display-only field and never treat it as a report.
+	run.blockedQuestion = run.status === "blocked" ? extractBlockedQuestion(report) : undefined;
+
 	// Send notification if settled or blocked and not yet notified
 	if (!run.notified && isHerdrAvailable()) {
 		if (run.status === "done") {
@@ -264,8 +294,9 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 			});
 		} else if (run.status === "blocked") {
 			run.notified = true;
+			const question = firstLine(extractBlockedQuestion(run.report) ?? "requires input", 80);
 			await showNotification(`Sub-agent ${run.agent} waiting for input`, {
-				body: `Sub-agent ${run.id} is blocked and requires input.`,
+				body: `${run.id}: ${question}`,
 				sound: "request",
 			});
 		} else if (run.status === "aborted") {
@@ -351,4 +382,132 @@ export async function collectRuns(options: {
 
 	await Promise.all(runs.map((r) => waitOne(r)));
 	return runs;
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation after a parent restart (phase 4)
+// ---------------------------------------------------------------------------
+
+function statusFromHerdr(status: string, fallback: RunStatus): RunStatus {
+	switch (status) {
+		case "working":
+			return "running";
+		case "blocked":
+			return "blocked";
+		case "idle":
+		case "done":
+			return "done";
+		default:
+			return fallback;
+	}
+}
+
+/** Abort for a pane run restored from the session (its spawner closure is gone). */
+function restoredPaneAbort(run: SubagentRun): (reason?: string) => Promise<void> {
+	return async (reason?: string) => {
+		try {
+			if (run.agentName) await sendKeys(run.agentName, "ctrl+c");
+		} catch {
+			/* the agent may already be gone */
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+		try {
+			if (run.paneId && !run.paneClosed) {
+				await closePane(run.paneId);
+				run.paneClosed = true;
+			}
+		} catch {
+			/* cleanup retries, or the pane is already gone */
+		}
+		run.status = "aborted";
+		run.stopReason = reason ?? "aborted";
+		run.endedAt = Date.now();
+	};
+}
+
+export interface ReconcileOptions {
+	runs: SubagentRun[];
+	/** Called once per run whose status changed, so the caller can persist the correction. */
+	onChange?: (run: SubagentRun) => void;
+	/** Test seam: live agents to match against (defaults to `herdr agent list`). */
+	liveAgents?: HerdrAgent[];
+	/** Test seam: pane liveness probe (defaults to `herdr pane layout`). */
+	paneAlive?: (paneId: string) => Promise<boolean>;
+}
+
+export interface ReconcileSummary {
+	restored: number;
+	/** Runs with a matching live herdr agent, re-adopted and tracked again. */
+	adopted: string[];
+	/** Runs transitioned to a final status because no live process backs them. */
+	settled: string[];
+}
+
+/**
+ * Reconcile runs reconstructed from the session branch against live Herdr
+ * agents. Live pane children are re-adopted (with a fresh abort handle) so the
+ * poller keeps tracking them; runs with no live agent are settled from their
+ * persisted report/session, and stale headless runs are marked failed.
+ */
+export async function reconcileRuns(options: ReconcileOptions): Promise<ReconcileSummary> {
+	const { runs, onChange, paneAlive } = options;
+	const summary: ReconcileSummary = { restored: runs.length, adopted: [], settled: [] };
+	if (runs.length === 0) return summary;
+
+	const herdrReady = isHerdrAvailable();
+	let live: Map<string, HerdrAgent>;
+	if (options.liveAgents) {
+		live = new Map(options.liveAgents.map((agent) => [agent.name || agent.agent, agent]));
+	} else if (herdrReady) {
+		live = new Map((await listAgents()).map((agent) => [agent.name || agent.agent, agent]));
+	} else {
+		live = new Map();
+	}
+
+	const probePane = paneAlive ?? (herdrReady ? isPaneAlive : async () => false);
+
+	for (const run of runs) {
+		const before = run.status;
+
+		if (run.mode === "headless") {
+			// A headless child is a child of the old parent process: nothing to adopt.
+			if (run.status === "running") {
+				run.status = "failed";
+				run.errorMessage ??= "Parent session ended while this headless child was running; the process could not be adopted.";
+				run.endedAt ??= Date.now();
+				await harvestReport(run);
+				summary.settled.push(run.id);
+			}
+			if (run.status !== before) onChange?.(run);
+			continue;
+		}
+
+		const agent = run.agentName ? live.get(run.agentName) : undefined;
+		if (agent) {
+			run.paneClosed = false;
+			if (agent.pane_id) run.paneId = agent.pane_id;
+			if (agent.tab_id) run.tabId = agent.tab_id;
+			run.abort = restoredPaneAbort(run);
+			run.status = statusFromHerdr(agent.agent_status, run.status);
+			if (run.status === "running") {
+				run.endedAt = undefined;
+			} else if (!run.endedAt) {
+				run.endedAt = Date.now();
+			}
+			if (run.status !== "running") await harvestReport(run);
+			summary.adopted.push(run.id);
+		} else {
+			run.paneClosed = run.paneId ? !(await probePane(run.paneId)) : true;
+			if (!isSettled(run.status)) {
+				run.status = "done";
+				run.endedAt ??= Date.now();
+				await harvestReport(run);
+				summary.settled.push(run.id);
+			}
+		}
+
+		if (run.status !== before) onChange?.(run);
+	}
+
+	return summary;
 }

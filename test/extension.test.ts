@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import extensionFactory from "../index.ts";
+import { emptyUsage } from "../state.ts";
 import {
 	closePane,
 	closeWorkspace,
@@ -56,6 +57,9 @@ function createMockContext(overrides: Partial<any> = {}) {
 				notifications.push({ msg, type });
 			},
 			confirm: async () => true,
+		},
+		sessionManager: {
+			getBranch: () => [],
 		},
 		modelRegistry: {
 			getAvailable: () => [
@@ -150,6 +154,186 @@ test("session_start installs the sub-agent status widget and updates it on spawn
 	assert.strictEqual(statuses[statuses.length - 1][1], undefined, "widget clears when nothing is active");
 });
 
+function persistedView(overrides: Record<string, unknown> & { id: string }): Record<string, unknown> {
+	return {
+		agent: "scout",
+		agentSource: "user",
+		task: "old task",
+		cwd: process.cwd(),
+		status: "running",
+		startedAt: 1,
+		usage: emptyUsage(),
+		reportPath: `/tmp/pi-subagent/${overrides.id}/report.md`,
+		collected: false,
+		mode: "headless",
+		...overrides,
+	};
+}
+
+test("session_start restores children from the session branch, settles stale runs, and reconciles them", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+
+	const entries = [
+		{
+			type: "custom",
+			customType: "herdr-subagent-run",
+			data: persistedView({ id: "sa-scout-987654", status: "done", endedAt: 2, collected: true, report: "Restored report body" }),
+		},
+		{ type: "custom", customType: "herdr-subagent-run", data: persistedView({ id: "sa-worker-987655", status: "running" }) },
+		{
+			type: "custom",
+			customType: "herdr-subagent-run",
+			data: persistedView({
+				id: "sa-reviewer-987656",
+				agent: "reviewer",
+				status: "blocked",
+				mode: "pane",
+				paneId: "%42",
+				agentName: "sa-reviewer-987656",
+				blockedQuestion: "Approve this edit?",
+				endedAt: undefined,
+			}),
+		},
+	];
+
+	const ctx = createMockContext({ sessionManager: { getBranch: () => entries } });
+	for (const handler of api.handlers.get("session_start") ?? []) {
+		await handler({ reason: "resume" }, ctx);
+	}
+
+	assert.ok(
+		ctx.notifications.some((n: any) => n.msg.includes("Restored 3 sub-agents")),
+		`expected a restore notification, got ${JSON.stringify(ctx.notifications)}`,
+	);
+
+	const statusTool = api.tools.get("subagent_status");
+	const statusRes = await statusTool.execute("call-status-restored", {}, undefined, undefined, ctx);
+	const runs = statusRes.details.runs;
+	assert.strictEqual(runs.length, 3);
+
+	const done = runs.find((r: any) => r.id === "sa-scout-987654");
+	assert.strictEqual(done.status, "done");
+	assert.strictEqual(done.report, "Restored report body");
+
+	const stale = runs.find((r: any) => r.id === "sa-worker-987655");
+	assert.strictEqual(stale.status, "failed", "stale headless runs cannot be adopted");
+
+	const blocked = runs.find((r: any) => r.id === "sa-reviewer-987656");
+	assert.strictEqual(blocked.status, "done", "a blocked child with no live agent is settled");
+	assert.strictEqual(blocked.paneClosed, true);
+
+	assert.ok(statusRes.content[0].text.includes("Totals:"), statusRes.content[0].text);
+});
+
+test("session_start re-adopts a live pane child from a previous session", async () => {
+	if (!isHerdrAvailable()) return;
+
+	const api1 = createMockExtensionAPI();
+	extensionFactory(api1);
+	const ctx1 = createMockContext({ mode: "tui" });
+
+	const spawnTool = api1.tools.get("spawn_subagent");
+	const spawnResult = await spawnTool.execute(
+		"call-spawn-live-adopt",
+		{ agent: "scout", task: "Say hi", mode: "pane", layout: "pane", wait: false },
+		undefined,
+		undefined,
+		ctx1,
+	);
+	const view = spawnResult.details.runs[0];
+	assert.ok(view?.paneId, "expected a pane child");
+
+	try {
+		// The mock API records exactly what the extension persisted for the branch.
+		// Use the newest snapshot: the dispatch entry predates the pane/agent identity.
+		const persisted = api1.entries
+			.filter((e: any) => e.type === "herdr-subagent-run" && e.data?.id === view.id)
+			.pop();
+		assert.ok(persisted, "spawn should persist the live child snapshot");
+		assert.strictEqual(persisted.data.agentName, view.id);
+		assert.ok(persisted.data.paneId);
+
+		// Simulate a parent restart: a fresh extension instance resumes the session
+		// and must find the still-running child via `herdr agent list`.
+		const api2 = createMockExtensionAPI();
+		extensionFactory(api2);
+		const ctx2 = createMockContext({
+			mode: "tui",
+			sessionManager: {
+				getBranch: () => [{ type: "custom", customType: "herdr-subagent-run", data: persisted.data }],
+			},
+		});
+		for (const handler of api2.handlers.get("session_start") ?? []) {
+			await handler({ reason: "resume" }, ctx2);
+		}
+		assert.ok(ctx2.notifications.some((n: any) => n.msg.includes("Restored 1 sub-agent")));
+
+		const statusTool = api2.tools.get("subagent_status");
+		const statusRes = await statusTool.execute("call-status-live-adopt", { ids: [view.id] }, undefined, undefined, ctx2);
+		const adopted = statusRes.details.runs[0];
+		assert.ok(adopted, "restored run should be listed");
+		assert.strictEqual(adopted.paneClosed, false, "a live pane must be re-adopted");
+		assert.ok(["running", "blocked", "done"].includes(adopted.status), adopted.status);
+
+		// The restored abort handle must also work through the new instance.
+		const abortTool = api2.tools.get("abort_subagent");
+		await abortTool.execute("call-abort-live-adopt", { id: view.id, force: true }, undefined, undefined, ctx2);
+	} finally {
+		for (const handler of api1.handlers.get("session_shutdown") ?? []) {
+			await handler({}, ctx1);
+		}
+	}
+});
+
+test("session_start does not adopt children in a forked session", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+
+	const entries = [
+		{ type: "custom", customType: "herdr-subagent-run", data: persistedView({ id: "sa-scout-12", status: "done" }) },
+	];
+	const ctx = createMockContext({ sessionManager: { getBranch: () => entries } });
+	for (const handler of api.handlers.get("session_start") ?? []) {
+		await handler({ reason: "fork" }, ctx);
+	}
+
+	const statusTool = api.tools.get("subagent_status");
+	const statusRes = await statusTool.execute("call-status-fork", {}, undefined, undefined, ctx);
+	assert.strictEqual(statusRes.details.runs.length, 0);
+	assert.strictEqual(ctx.notifications.length, 0, "forked sessions start with a clean registry");
+});
+
+test("/subagents answer relays to pane children only", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext();
+
+	const spawnTool = api.tools.get("spawn_subagent");
+	const spawnResult = await spawnTool.execute(
+		"call-spawn-answer",
+		{ agent: "scout", task: "Say hello", mode: "headless", wait: false },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const run = spawnResult.details.runs[0];
+	const subagentsCmd = api.commands.get("subagents");
+
+	try {
+		await subagentsCmd.handler(`answer ${run.id} use the other file`, ctx);
+		const last = ctx.notifications[ctx.notifications.length - 1];
+		assert.strictEqual(last.type, "error");
+		assert.ok(last.msg.includes("headless"), last.msg);
+
+		await subagentsCmd.handler("answer sa-nope-99 hi", ctx);
+		assert.ok(ctx.notifications[ctx.notifications.length - 1].msg.includes("Unknown sub-agent"));
+	} finally {
+		const abortTool = api.tools.get("abort_subagent");
+		await abortTool.execute("call-abort-answer", { id: run.id, force: true }, undefined, undefined, ctx);
+	}
+});
+
 test("subagent_message rejects unknown and headless children", async () => {
 	const api = createMockExtensionAPI();
 	extensionFactory(api);
@@ -225,6 +409,7 @@ test("subagents command completions suggest subcommands and run ids", () => {
 	const values = subcmdCompletions.map((c: any) => c.label);
 	assert.ok(values.includes("list"));
 	assert.ok(values.includes("focus"));
+	assert.ok(values.includes("answer"));
 	assert.ok(values.includes("abort"));
 	assert.ok(values.includes("collect"));
 	assert.ok(values.includes("cleanup"));

@@ -438,12 +438,36 @@ reconstructed on `session_start` from the branch (`ctx.sessionManager.getBranch(
     delegates by policy, not eagerness (includes the model-selection
     guidance). *(Done: tool descriptions updated and `DELEGATION_GUIDELINES` appended to `systemPromptOptions.promptGuidelines` when `spawn_subagent` is active.)*
 
-**Phase 4 — hardening**
+**Phase 4 — hardening** *(implemented)*
 - Blocked-child UX (surface `blocked` state, let the user answer the child
   directly via `agent focus`, or relay answers).
+  *(Done: `harvestReport` captures the pending prompt as a display-only
+  `blockedQuestion` (never persisted as a report); `subagent_status`,
+  `collect_subagents`, `/subagents list`, and the TUI renderers show it with
+  an answer hint; `/subagents focus` points at the prompt and the new
+  `/subagents answer <id> <text>` command relays an answer through the same
+  `promptAgent` path as `subagent_message`. The background poller now watches
+  blocked children too, so answering a child directly in its pane resumes
+  tracking and the later completion is harvested and notified.)*
 - Reconciliation on `session_start` (children from a previous run:
   adopt/ignore via `herdr agent list`).
+  *(Done: `reconstructRuns()` merges the `herdr-subagent-run` custom entries
+  on the active branch (newest snapshot wins; cumulative usage only moves
+  forward; reports survive entries that lack one). On `startup`/`resume`/
+  `reload` (never `new`/`fork`), `reconcileRuns()` matches persisted pane
+  runs against `herdr agent list`: live agents are re-adopted with a fresh
+  abort handle and live pane ids, runs with no live process are settled from
+  their persisted report/session, and stale running headless children are
+  failed. The live pane/agent identity is now persisted right after
+  `agent start`, so a crashed parent can adopt the child at all; owned
+  source workspaces are re-registered for later worktree runs, and a
+  bounded window (most recent 100 runs) keeps restores finite.)*
 - Token/usage accounting across children (session JSONL usage totals).
+  *(Done: `harvestReport` re-reads the child's session JSONL on every
+  harvest, so a blocked-then-resumed child reports full totals; `sumUsage()`
+  aggregates turns/tokens/cache/cost and takes the max context size; a
+  `Totals:` line is appended to `subagent_status`, `collect_subagents`, and
+  `/subagents list`.)*
 
 ---
 

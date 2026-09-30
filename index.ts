@@ -12,6 +12,11 @@
  *   - `/subagents` command: user-facing command to list, focus, abort, collect,
  *     and cleanup sub-agents.
  *
+ * Phase 4 adds hardening: blocked-child UX (`blockedQuestion` surfaced in
+ * status/collect/list output, `/subagents answer` relay, the poller resumes
+ * tracking a child answered in its pane), resume-time reconciliation of live
+ * pane children from the session branch, and session-wide usage totals.
+ *
  * Every child is isolated: its own context window, a narrowed tool allowlist,
  * `--no-extensions --no-skills`, a sanitized environment (`HERDR_ENV=0`), and
  * the `guard.ts` extension that blocks herdr access.
@@ -36,7 +41,15 @@ import {
 	loadAdhocAgent,
 	THINKING_LEVELS,
 } from "./agents.ts";
-import { collectRuns, harvestReport } from "./collect.ts";
+import { collectRuns, harvestReport, reconcileRuns } from "./collect.ts";
+import {
+	formatDuration,
+	formatLocation,
+	formatRunSummary,
+	formatUsageStats,
+	formatUsageTotals,
+	statusIcon,
+} from "./format.ts";
 import {
 	closePane,
 	closeTab,
@@ -66,12 +79,14 @@ import {
 	forgetSourceWorkspace,
 	prepareWorktree,
 	removeGitWorktree,
+	adoptSourceWorkspace,
 	type PreparedWorktree,
 } from "./worktree.ts";
 import {
 	emptyUsage,
 	isSettled,
 	type LayoutChoice,
+	reconstructRuns,
 	REPORT_CAP_BYTES,
 	RunRegistry,
 	type RunView,
@@ -81,73 +96,6 @@ import {
 	truncateBytes,
 	wrapUntrustedReport,
 } from "./state.ts";
-
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-function formatDuration(ms?: number): string {
-	if (!ms || ms <= 0) return "";
-	const s = Math.round(ms / 1000);
-	if (s < 60) return `${s}s`;
-	const m = Math.floor(s / 60);
-	const remS = s % 60;
-	return `${m}m ${remS}s`;
-}
-
-/** Compact pane/worktree location suffix for status lines. */
-function formatLocation(view: RunView): string {
-	const parts: string[] = [];
-	if (view.paneId) parts.push(`pane: ${view.paneId}`);
-	if (view.worktreeBranch) parts.push(`worktree: ${view.worktreeBranch}`);
-	return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
-}
-
-function statusIcon(status: RunView["status"]): string {
-	switch (status) {
-		case "running":
-			return "⏳";
-		case "done":
-			return "✓";
-		case "aborted":
-			return "■";
-		case "blocked":
-			return "⏸";
-		default:
-			return "✗";
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Shared details
@@ -176,6 +124,25 @@ interface MessageDetails {
 	run?: RunView;
 	success: boolean;
 	message: string;
+}
+
+/** Final tool text for an inline `wait: true` spawn (blocked runs are not reports). */
+function formatSpawnResult(view: RunView, text: string, truncated: boolean): string {
+	if (view.status === "blocked") {
+		return `${formatRunSummary(view)}\n\nPending text (untrusted, may be stale):\n${wrapUntrustedReport(text)}`;
+	}
+	const usageStr = formatUsageStats(view.usage, view.model);
+	const durationStr = formatDuration(view.durationMs);
+	const paneStr = view.paneId ? ` [pane: ${view.paneId}]` : "";
+	const worktreeStr = view.worktreeBranch ? ` [worktree: ${view.worktreeBranch}]` : "";
+	const header =
+		`${statusIcon(view.status)} ${view.agent} (${view.id})${paneStr}${worktreeStr} — ${view.status}` +
+		(durationStr ? ` (${durationStr})` : "") +
+		(usageStr ? `\n${usageStr}` : "");
+	const body =
+		`\n\n${wrapUntrustedReport(text)}` +
+		(truncated ? `\n\n[Report truncated at ${REPORT_CAP_BYTES} bytes. Full report: ${view.reportPath}]` : "");
+	return `${header}${body}`;
 }
 
 /** Delegation policy injected into the parent's prompt via `before_agent_start`. */
@@ -476,13 +443,79 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	// Background poller for live Herdr agents
+	// Parent -> child steering, shared by the subagent_message tool and the
+	// /subagents answer command (phase 4 blocked-child UX).
+	const steerPaneChild = async (
+		run: SubagentRun,
+		message: string,
+		wait: boolean,
+	): Promise<{ ok: true } | { ok: false; error: string }> => {
+		if (run.mode !== "pane" || !run.agentName) {
+			return {
+				ok: false,
+				error:
+					`Sub-agent ${run.id} runs headless and cannot be steered. Spawn a new sub-agent with the ` +
+					`extra context instead.`,
+			};
+		}
+		if (run.paneClosed) {
+			return { ok: false, error: `Sub-agent ${run.id} has no open pane to steer.` };
+		}
+		if (run.status !== "running" && run.status !== "blocked") {
+			return {
+				ok: false,
+				error:
+					`Sub-agent ${run.id} is already ${run.status} and its pane is idle. Spawn a new sub-agent ` +
+					`instead of steering a finished one.`,
+			};
+		}
+
+		try {
+			try {
+				await promptAgent(run.agentName, message, {
+					wait,
+					until: ["working", "blocked", "done"],
+					timeoutMs: 15000,
+				});
+			} catch (err: any) {
+				// A stalled/timed-out prompt is usually still delivered; only fail
+				// when the agent is confirmed gone.
+				const stalledOrTimeout = err?.code === "agent_prompt_stalled" || err?.code === "timeout";
+				if (!stalledOrTimeout) throw err;
+				const agent = await getAgent(run.agentName).catch(() => null);
+				if (!agent) throw err;
+			}
+
+			run.status = "running";
+			run.endedAt = undefined;
+			run.notified = false;
+			run.collected = false;
+			run.blockedQuestion = undefined;
+			refreshStatusWidget();
+			pi.appendEntry("herdr-subagent-run", toView(run));
+			return { ok: true };
+		} catch (err: any) {
+			return { ok: false, error: `Failed to message ${run.id}: ${err?.message ?? String(err)}` };
+		}
+	};
+
+	// Background poller for live Herdr agents. Watches running *and* blocked pane
+	// children: a blocked child the user answers directly in its pane must resume
+	// being tracked (and finish harvesting) without a manual status call.
 	const checkLiveAgents = async () => {
 		if (!isHerdrAvailable()) return;
-		const activePanes = registry.activePaneRuns();
-		if (activePanes.length === 0) return;
+		const watched = registry
+			.list()
+			.filter(
+				(r) =>
+					r.mode === "pane" &&
+					Boolean(r.agentName) &&
+					!r.paneClosed &&
+					(r.status === "running" || r.status === "blocked"),
+			);
+		if (watched.length === 0) return;
 
-		for (const run of activePanes) {
+		for (const run of watched) {
 			if (!run.agentName) continue;
 			try {
 				const agent = await getAgent(run.agentName);
@@ -492,24 +525,76 @@ export default function (pi: ExtensionAPI) {
 					const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
 					run.paneClosed = !paneAlive;
 					run.status = "done";
-					run.endedAt = Date.now();
-					await harvestReport(run);
-					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-				} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-					run.status = "done";
-					run.endedAt = Date.now();
+					run.endedAt ??= Date.now();
 					await harvestReport(run);
 					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
 				} else if (agent.agent_status === "blocked") {
+					const becameBlocked = run.status !== "blocked";
 					run.status = "blocked";
 					await harvestReport(run);
+					// Persist the pending question so a resumed session can surface it.
+					if (becameBlocked) pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
+				} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
+					run.status = "done";
+					run.endedAt ??= Date.now();
+					await harvestReport(run);
+					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
+				} else if (agent.agent_status === "working" && run.status === "blocked") {
+					// The user (or another process) answered the child in its pane:
+					// resume tracking so the next completion is harvested and notified.
+					run.status = "running";
+					run.endedAt = undefined;
+					run.notified = false;
+					run.collected = false;
+					run.blockedQuestion = undefined;
+					pi.appendEntry("herdr-subagent-run", toView(run));
 				}
 			} catch {
-				/* transient herdr error, keep run as running */
+				/* transient herdr error, keep run as-is */
 			}
 		}
 
 		refreshStatusWidget();
+	};
+
+	/**
+	 * Phase 4 (Plan 4): rebuild children from the session branch on resume and
+	 * reconcile them against live Herdr agents. Live pane children are adopted
+	 * (with a fresh abort handle) so polling/collection continue; children that
+	 * no longer have a process are settled from their persisted report/session.
+	 */
+	const restoreRunsFromSession = async (event: { reason?: string }, ctx: ExtensionContext) => {
+		// A fresh session has no history; a fork's children belong to the source
+		// session and must not be double-adopted here.
+		if (event.reason === "new" || event.reason === "fork") return;
+		try {
+			const branch = ctx.sessionManager?.getBranch?.() ?? [];
+			// Only the most recent runs matter for adoption and cleanup; a very long
+			// session must not restore unbounded history into the registry.
+			const restored = reconstructRuns(branch).slice(-100);
+			if (restored.length === 0) return;
+
+			registry.restore(restored);
+			for (const run of restored) {
+				if (run.ownedSourceWorkspace && run.worktreeRepoRoot) {
+					adoptSourceWorkspace(run.worktreeRepoRoot, run.ownedSourceWorkspace);
+				}
+			}
+
+			const summary = await reconcileRuns({
+				runs: restored,
+				onChange: (run) => pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true })),
+			});
+
+			if (ctx.hasUI) {
+				const parts = [`Restored ${summary.restored} sub-agent${summary.restored === 1 ? "" : "s"} from the previous session`];
+				if (summary.adopted.length > 0) parts.push(`${summary.adopted.length} re-adopted`);
+				if (summary.settled.length > 0) parts.push(`${summary.settled.length} settled`);
+				ctx.ui.notify(`${parts.join("; ")}.`, "info");
+			}
+		} catch {
+			/* reconciliation is best-effort: never block session startup */
+		}
 	};
 
 	// Phase 3 (Plan item 12): inject the delegation policy as prompt guidelines so
@@ -522,9 +607,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		ctxInfo = { registry: ctx.modelRegistry, cwd: ctx.cwd };
 		uiContext = ctx;
+		await restoreRunsFromSession(event, ctx);
 		refreshStatusWidget();
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = setInterval(() => void checkLiveAgents(), 3000);
@@ -785,6 +871,11 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
+				// Persist the live pane/agent identity (the dispatch snapshot above only
+				// carries the request), so a session resumed after a parent crash can
+				// re-adopt this child from `herdr agent list` (phase 4).
+				pi.appendEntry("herdr-subagent-run", toView(run));
+
 				if (!wait) {
 					const worktreeStr = run.worktreeBranch ? `, worktree: ${run.worktreeBranch}` : "";
 					return {
@@ -824,18 +915,9 @@ export default function (pi: ExtensionAPI) {
 
 				const view = toView(run, { includeReport: true });
 				const { text, truncated } = truncateBytes(run.report || "(no output)");
-				const usageStr = formatUsageStats(view.usage, view.model);
-				const durationStr = formatDuration(view.durationMs);
-				const header =
-					`${statusIcon(view.status)} ${view.agent} (${view.id}) [pane: ${view.paneId}] — ${view.status}` +
-					(durationStr ? ` (${durationStr})` : "") +
-					(usageStr ? `\n${usageStr}` : "");
-				const body =
-					`\n\n${wrapUntrustedReport(text)}` +
-					(truncated ? `\n\n[Report truncated at ${REPORT_CAP_BYTES} bytes. Full report: ${run.reportPath}]` : "");
 
 				return {
-					content: [{ type: "text", text: `${header}${body}` }],
+					content: [{ type: "text", text: formatSpawnResult(view, text, truncated) }],
 					details: { mode: "pane", runs: [view] },
 					isError: view.status === "failed" || view.status === "aborted",
 				};
@@ -875,18 +957,9 @@ export default function (pi: ExtensionAPI) {
 
 			const view = toView(run, { includeReport: true });
 			const { text, truncated } = truncateBytes(run.report || "(no output)");
-			const usageStr = formatUsageStats(view.usage, view.model);
-			const durationStr = formatDuration(view.durationMs);
-			const header =
-				`${statusIcon(view.status)} ${view.agent} (${view.id}) — ${view.status}` +
-				(durationStr ? ` (${durationStr})` : "") +
-				(usageStr ? `\n${usageStr}` : "");
-			const body =
-				`\n\n${wrapUntrustedReport(text)}` +
-				(truncated ? `\n\n[Report truncated at ${REPORT_CAP_BYTES} bytes. Full report: ${run.reportPath}]` : "");
 
 			return {
-				content: [{ type: "text", text: `${header}${body}` }],
+				content: [{ type: "text", text: formatSpawnResult(view, text, truncated) }],
 				details: { mode: "headless", runs: [view] },
 				isError: view.status === "failed" || view.status === "aborted",
 			};
@@ -971,7 +1044,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Collect Sub-agents",
 		description:
 			"Wait for running sub-agents to settle (idle, done, or blocked) and harvest their reports. " +
-			"Returns final markdown reports, token usage, and execution status. Reports are capped at 50 KB.",
+			"Returns final markdown reports, token usage, and execution status. Blocked children return the pending " +
+			"question and how to answer (subagent_message); session-wide usage totals are appended. Reports are capped at 50 KB.",
 		parameters: CollectParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -1002,22 +1076,19 @@ export default function (pi: ExtensionAPI) {
 
 			const lines: string[] = [];
 			for (const view of views) {
-				const usageStr = formatUsageStats(view.usage, view.model);
-				const durationStr = formatDuration(view.durationMs);
-				const paneStr = formatLocation(view);
-				lines.push(
-					`${statusIcon(view.status)} ${view.id} (${view.agent})${paneStr} — ${view.status}` +
-						(durationStr ? ` (${durationStr})` : "") +
-						(usageStr ? `\n   ${usageStr}` : "") +
-						`\n   task: ${view.task.split("\n")[0]}` +
-						(view.errorMessage ? `\n   error: ${view.errorMessage}` : "") +
-						`\n   report: ${view.reportPath}`,
-				);
-				if (view.report) {
+				lines.push(formatRunSummary(view));
+				if (view.status === "blocked") {
+					// The pending prompt is display-only data, never a final report.
+					if (view.report) {
+						lines.push("", `Pending text for ${view.id} (untrusted, may be stale):`, wrapUntrustedReport(view.report), "");
+					}
+				} else if (view.report) {
 					lines.push("", wrapUntrustedReport(view.report), "");
 				}
 			}
 			if (missing.length > 0) lines.push(`Unknown run ids: ${missing.join(", ")}`);
+			const totals = formatUsageTotals(views);
+			if (totals) lines.push("", totals);
 
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
@@ -1047,8 +1118,13 @@ export default function (pi: ExtensionAPI) {
 				const paneStr = run.paneId ? ` [${run.paneId}]` : "";
 				text += `\n${statusIcon(run.status)} ${theme.fg("accent", run.id)}${theme.fg("dim", paneStr)} ${theme.fg("muted", run.agent)}`;
 				if (usageStr) text += ` ${theme.fg("dim", usageStr)}`;
+				if (run.status === "blocked") {
+					text += `\n${theme.fg("warning", "blocked — waiting for input; use subagent_message to answer")}`;
+				}
 				if (expanded && run.report) text += `\n${theme.fg("toolOutput", run.report)}`;
 			}
+			const totals = formatUsageTotals(runs);
+			if (totals) text += `\n${theme.fg("dim", totals)}`;
 			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 			return new Text(text, 0, 0);
 		},
@@ -1063,7 +1139,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Sub-agent Status",
 		description:
 			"List tracked sub-agents with their live state, pane/tab location, usage, and (for finished runs) their report. " +
-			"Set wait=true to block until running children settle. Reports are capped at 50 KB.",
+			"Blocked children show the pending question and how to answer (subagent_message or /subagents answer); " +
+			"session-wide usage totals are appended. Set wait=true to block until running children settle. Reports are capped at 50 KB.",
 		parameters: StatusParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -1090,21 +1167,28 @@ export default function (pi: ExtensionAPI) {
 							if (!agent) {
 								const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
 								run.paneClosed = !paneAlive;
-								if (run.status === "running") {
+								if (run.status === "running" || run.status === "blocked") {
 									run.status = "done";
-									run.endedAt = Date.now();
+									run.endedAt ??= Date.now();
 								}
 							} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
 								run.status = "done";
 								run.endedAt ??= Date.now();
 							} else if (agent.agent_status === "blocked") {
 								run.status = "blocked";
+							} else if (agent.agent_status === "working" && run.status === "blocked") {
+								// The child was answered in its pane and is working again.
+								run.status = "running";
+								run.endedAt = undefined;
+								run.notified = false;
+								run.collected = false;
+								run.blockedQuestion = undefined;
 							}
 						} catch {
 							/* transient error, keep status */
 						}
 					}
-					if (isSettled(run.status)) {
+					if (isSettled(run.status) || run.status === "blocked") {
 						await harvestReport(run);
 					}
 				}
@@ -1128,22 +1212,19 @@ export default function (pi: ExtensionAPI) {
 
 			const lines: string[] = [];
 			for (const view of views) {
-				const usageStr = formatUsageStats(view.usage, view.model);
-				const durationStr = formatDuration(view.durationMs);
-				const paneStr = formatLocation(view);
-				lines.push(
-					`${statusIcon(view.status)} ${view.id} (${view.agent})${paneStr} — ${view.status}` +
-						(durationStr ? ` (${durationStr})` : "") +
-						(usageStr ? `\n   ${usageStr}` : "") +
-						`\n   task: ${view.task.split("\n")[0]}` +
-						(view.errorMessage ? `\n   error: ${view.errorMessage}` : "") +
-						`\n   report: ${view.reportPath}`,
-				);
-				if (view.report) {
+				lines.push(formatRunSummary(view));
+				if (view.status === "blocked") {
+					// The pending prompt is display-only data, never a final report.
+					if (view.report) {
+						lines.push("", `Pending text for ${view.id} (untrusted, may be stale):`, wrapUntrustedReport(view.report), "");
+					}
+				} else if (view.report) {
 					lines.push("", wrapUntrustedReport(view.report), "");
 				}
 			}
 			if (missing.length > 0) lines.push(`Unknown run ids: ${missing.join(", ")}`);
+			const totals = formatUsageTotals(views);
+			if (totals) lines.push("", totals);
 
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
@@ -1174,8 +1255,13 @@ export default function (pi: ExtensionAPI) {
 				const paneStr = run.paneId ? ` [${run.paneId}]` : "";
 				text += `\n${statusIcon(run.status)} ${theme.fg("accent", run.id)}${theme.fg("dim", paneStr)} ${theme.fg("muted", run.agent)}`;
 				if (usageStr) text += ` ${theme.fg("dim", usageStr)}`;
+				if (run.status === "blocked") {
+					text += `\n${theme.fg("warning", "blocked — waiting for input; use subagent_message to answer")}`;
+				}
 				if (expanded && run.report) text += `\n${theme.fg("toolOutput", run.report)}`;
 			}
+			const totals = formatUsageTotals(runs);
+			if (totals) text += `\n${theme.fg("dim", totals)}`;
 			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 			return new Text(text, 0, 0);
 		},
@@ -1283,81 +1369,23 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (run.mode !== "pane" || !run.agentName) {
+			const result = await steerPaneChild(run, params.message, params.wait ?? true);
+			if (!result.ok) {
 				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Sub-agent ${run.id} runs headless and cannot be steered. Spawn a new sub-agent with the ` +
-								`extra context instead.`,
-						},
-					],
-					details: { run: toView(run), success: false, message: "headless children cannot be steered" },
+					content: [{ type: "text", text: result.error }],
+					details: { run: toView(run), success: false, message: result.error },
 					isError: true,
 				};
 			}
 
-			if (run.paneClosed) {
-				return {
-					content: [{ type: "text", text: `Sub-agent ${run.id} has no open pane to steer.` }],
-					details: { run: toView(run), success: false, message: "pane is closed" },
-					isError: true,
-				};
-			}
-
-			if (run.status !== "running" && run.status !== "blocked") {
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Sub-agent ${run.id} is already ${run.status} and its pane is idle. Spawn a new sub-agent ` +
-								`instead of steering a finished one.`,
-						},
-					],
-					details: { run: toView(run), success: false, message: `already ${run.status}` },
-					isError: true,
-				};
-			}
-
-			try {
-				try {
-					await promptAgent(run.agentName, params.message, {
-						wait: params.wait ?? true,
-						until: ["working", "blocked", "done"],
-						timeoutMs: 15000,
-					});
-				} catch (err: any) {
-					// A stalled/timed-out prompt is usually still delivered; only fail
-					// when the agent is confirmed gone.
-					const stalledOrTimeout = err?.code === "agent_prompt_stalled" || err?.code === "timeout";
-					if (!stalledOrTimeout) throw err;
-					const agent = await getAgent(run.agentName).catch(() => null);
-					if (!agent) throw err;
-				}
-
-				run.status = "running";
-				run.endedAt = undefined;
-				run.notified = false;
-				refreshStatusWidget();
-				pi.appendEntry("herdr-subagent-run", toView(run));
-
-				return {
-					content: [{ type: "text", text: `Sent follow-up to ${run.id} (${run.agent}).` }],
-					details: {
-						run: toView(run),
-						success: true,
-						message: `messaged ${run.id}`,
-					},
-				};
-			} catch (err: any) {
-				return {
-					content: [{ type: "text", text: `Failed to message ${run.id}: ${err?.message ?? String(err)}` }],
-					details: { run: toView(run), success: false, message: err?.message ?? String(err) },
-					isError: true,
-				};
-			}
+			return {
+				content: [{ type: "text", text: `Sent follow-up to ${run.id} (${run.agent}).` }],
+				details: {
+					run: toView(run),
+					success: true,
+					message: `messaged ${run.id}`,
+				},
+			};
 		},
 
 		renderCall(args, theme, _context) {
@@ -1391,10 +1419,10 @@ export default function (pi: ExtensionAPI) {
 	// -------------------------------------------------------------------------
 
 	pi.registerCommand("subagents", {
-		description: "Manage Herdr sub-agents (list, focus, abort, collect, cleanup)",
+		description: "Manage Herdr sub-agents (list, focus, answer, abort, collect, cleanup)",
 		getArgumentCompletions: (prefix: string) => {
 			const tokens = prefix.trimStart().split(/\s+/);
-			const subcmds = ["list", "focus", "abort", "collect", "cleanup"];
+			const subcmds = ["list", "focus", "answer", "abort", "collect", "cleanup"];
 
 			if (tokens.length <= 1) {
 				const current = tokens[0] ?? "";
@@ -1406,7 +1434,7 @@ export default function (pi: ExtensionAPI) {
 			const action = tokens[0];
 			const currentTarget = tokens[1] ?? "";
 
-			if (action === "focus" || action === "abort" || action === "collect") {
+			if (action === "focus" || action === "answer" || action === "abort" || action === "collect") {
 				const runs = registry.list();
 				return runs
 					.filter((r) => r.id.startsWith(currentTarget) || (r.agentName && r.agentName.startsWith(currentTarget)))
@@ -1439,8 +1467,22 @@ export default function (pi: ExtensionAPI) {
 					const paneStr = view.paneId ? formatLocation(view) : ` [${view.mode}]`;
 					const durStr = formatDuration(view.durationMs);
 					const usageStr = formatUsageStats(view.usage, view.model);
-					return `${icon} ${view.id} (${view.agent})${paneStr} — ${view.status}${durStr ? ` (${durStr})` : ""}${usageStr ? ` — ${usageStr}` : ""}`;
+					let line = `${icon} ${view.id} (${view.agent})${paneStr} — ${view.status}${durStr ? ` (${durStr})` : ""}${usageStr ? ` — ${usageStr}` : ""}`;
+					if (view.status === "blocked") {
+						line += `\n   blocked on: ${view.blockedQuestion?.split("\n")[0] ?? "(open the pane to see the prompt)"}`;
+					}
+					return line;
 				});
+
+				const totals = formatUsageTotals(runs);
+				if (totals) lines.push("", totals);
+				const blocked = runs.filter((r) => r.status === "blocked");
+				if (blocked.length > 0) {
+					lines.push(
+						"",
+						`Answer a blocked child with /subagents answer <id> <text>, or /subagents focus <id> to reply in its pane.`,
+					);
+				}
 
 				ctx.ui.notify(`Sub-agents:\n${lines.join("\n")}`, "info");
 				return;
@@ -1478,13 +1520,42 @@ export default function (pi: ExtensionAPI) {
 						} else if (run.tabId) {
 							await focusTab(run.tabId);
 						}
-						ctx.ui.notify(`Focused sub-agent ${run.id} (${run.paneId || run.tabId}).`, "info");
+						const hint =
+							run.status === "blocked"
+								? ` It is blocked; answer with /subagents answer ${run.id} <text> or type directly in the pane.`
+								: "";
+						ctx.ui.notify(`Focused sub-agent ${run.id} (${run.paneId || run.tabId}).${hint}`, "info");
 					} catch (err: any) {
 						ctx.ui.notify(`Failed to focus sub-agent ${run.id}: ${err.message}`, "error");
 					}
 				} else {
 					ctx.ui.notify(`Sub-agent ${run.id} is in headless mode (no pane to focus).`, "warning");
 				}
+				return;
+			}
+
+			if (action === "answer") {
+				const messageText = rest.join(" ").trim();
+				if (!targetId || !messageText) {
+					ctx.ui.notify("Usage: /subagents answer <id> <text>", "warning");
+					return;
+				}
+				const run =
+					registry.get(targetId) ??
+					registry.findByAgentName(targetId) ??
+					registry.findByPaneId(targetId);
+
+				if (!run) {
+					ctx.ui.notify(`Unknown sub-agent "${targetId}".`, "error");
+					return;
+				}
+
+				const result = await steerPaneChild(run, messageText, true);
+				if (!result.ok) {
+					ctx.ui.notify(result.error, "error");
+					return;
+				}
+				ctx.ui.notify(`Sent answer to ${run.id} (${run.agent}).`, "info");
 				return;
 			}
 
@@ -1748,7 +1819,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			ctx.ui.notify(
-				`Unknown subcommand "${action}". Available: /subagents [list|focus <id>|abort <id>|collect [id]|cleanup [--force] [--worktrees]]`,
+				`Unknown subcommand "${action}". Available: /subagents [list|focus <id>|answer <id> <text>|abort <id>|collect [id]|cleanup [--force] [--worktrees]]`,
 				"warning",
 			);
 		},

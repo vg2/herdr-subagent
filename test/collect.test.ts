@@ -9,9 +9,11 @@ import {
 	parseSessionJsonl,
 	harvestReport,
 	collectRuns,
+	extractBlockedQuestion,
+	reconcileRuns,
 } from "../collect.ts";
 import { emptyUsage, type SubagentRun } from "../state.ts";
-import { isHerdrAvailable } from "../herdr.ts";
+import { isHerdrAvailable, type HerdrAgent } from "../herdr.ts";
 
 test("findSessionFile locates session by cwd and sessionId", () => {
 	const cwd = process.cwd();
@@ -316,6 +318,8 @@ test("harvestReport keeps blocked-run text display-only so a later harvest reads
 	try {
 		await harvestReport(run);
 		assert.strictEqual(run.report, "Intermediate text while blocked");
+		assert.strictEqual(run.blockedQuestion, "Intermediate text while blocked");
+		assert.strictEqual(run.usage.turns, 1);
 		assert.strictEqual(fs.existsSync(reportPath), false, "blocked-run text must not be persisted to reportPath");
 
 		// Child is unblocked and finishes: the final assistant message lands in the session
@@ -324,6 +328,9 @@ test("harvestReport keeps blocked-run text display-only so a later harvest reads
 
 		await harvestReport(run);
 		assert.strictEqual(run.report, "Final report after unblock");
+		assert.strictEqual(run.blockedQuestion, undefined, "a finished run must clear the blocked question");
+		assert.strictEqual(run.usage.turns, 2, "usage is re-read from the session after a resumed run finishes");
+		assert.strictEqual(run.usage.input, 20);
 		assert.strictEqual(fs.readFileSync(reportPath, "utf-8"), "Final report after unblock");
 	} finally {
 		if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
@@ -361,4 +368,156 @@ test("harvestReport marks aborted runs as notified", async () => {
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// extractBlockedQuestion + reconciliation (phase 4)
+// ---------------------------------------------------------------------------
+
+function makeRun(overrides: Partial<SubagentRun> & { id: string }): SubagentRun {
+	return {
+		agent: "scout",
+		agentSource: "user",
+		task: "task",
+		cwd: process.cwd(),
+		status: "running",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: "/tmp/pi-subagent/test",
+		reportPath: path.join(os.tmpdir(), "pi-subagent", overrides.id, "report.md"),
+		collected: false,
+		report: "",
+		mode: "pane",
+		abort: () => {},
+		paneId: "%1",
+		agentName: overrides.id,
+		...overrides,
+	};
+}
+
+test("extractBlockedQuestion collapses whitespace, ignores placeholders, and caps length", () => {
+	assert.strictEqual(extractBlockedQuestion(undefined), undefined);
+	assert.strictEqual(extractBlockedQuestion("   \n\n "), undefined);
+	assert.strictEqual(extractBlockedQuestion("(no output)"), undefined);
+	assert.strictEqual(extractBlockedQuestion("  line one  \n\n line two "), "line one\nline two");
+	const capped = extractBlockedQuestion("x".repeat(1000), 10);
+	assert.strictEqual(capped?.length, 10);
+	assert.ok(capped?.endsWith("…"));
+});
+
+test("reconcileRuns re-adopts a live blocked pane child with its pending question", async () => {
+	const run = makeRun({ id: "sa-test-reconcile-blocked", status: "running", paneId: "%7" });
+	try {
+		const live: HerdrAgent[] = [
+			{
+				agent: run.id,
+				name: run.id,
+				agent_status: "blocked",
+				pane_id: "%8",
+				tab_id: "tab-1",
+				workspace_id: "ws-1",
+			},
+		];
+		const changed: SubagentRun[] = [];
+		const summary = await reconcileRuns({
+			runs: [run],
+			liveAgents: live,
+			paneAlive: async () => true,
+			onChange: (r) => changed.push(r),
+		});
+
+		assert.deepStrictEqual(summary.adopted, [run.id]);
+		assert.deepStrictEqual(summary.settled, []);
+		assert.strictEqual(run.status, "blocked");
+		assert.strictEqual(run.paneClosed, false);
+		assert.strictEqual(run.paneId, "%8", "live agent pane wins over the persisted pane id");
+		assert.strictEqual(typeof run.abort, "function");
+		assert.deepStrictEqual(changed.map((r) => r.id), [run.id]);
+	} finally {
+		/* nothing to clean up: no herdr calls were made (test seams supplied) */
+	}
+});
+
+test("reconcileRuns settles runs with no live agent and reports pane closure", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-reconcile-dead-"));
+	const reportPath = path.join(tmpDir, "report.md");
+	fs.writeFileSync(reportPath, "persisted report");
+	const run = makeRun({
+		id: "sa-test-reconcile-dead",
+		status: "running",
+		paneId: "%9",
+		dir: tmpDir,
+		reportPath,
+	});
+
+	try {
+		const probed: string[] = [];
+		const changed: SubagentRun[] = [];
+		const summary = await reconcileRuns({
+			runs: [run],
+			liveAgents: [],
+			paneAlive: async (paneId) => {
+				probed.push(paneId);
+				return false;
+			},
+			onChange: (r) => changed.push(r),
+		});
+
+		assert.deepStrictEqual(summary.settled, [run.id]);
+		assert.strictEqual(run.status, "done");
+		assert.strictEqual(run.paneClosed, true);
+		assert.strictEqual(run.report, "persisted report");
+		assert.deepStrictEqual(probed, ["%9"]);
+		assert.deepStrictEqual(changed.map((r) => r.id), [run.id]);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("reconcileRuns fails a stale running headless child and leaves settled runs alone", async () => {
+	const running = makeRun({ id: "sa-test-headless-stale", status: "running", mode: "headless" });
+	running.agentName = undefined;
+	running.paneId = undefined;
+	const settled = makeRun({ id: "sa-test-headless-done", status: "done", mode: "headless" });
+	settled.agentName = undefined;
+	settled.paneId = undefined;
+
+	const changed: SubagentRun[] = [];
+	const summary = await reconcileRuns({
+		runs: [running, settled],
+		liveAgents: [],
+		paneAlive: async () => false,
+		onChange: (r) => changed.push(r),
+	});
+
+	assert.deepStrictEqual(summary.settled, [running.id]);
+	assert.strictEqual(running.status, "failed");
+	assert.ok(running.errorMessage?.includes("could not be adopted"));
+	assert.ok(running.report.includes("could not be adopted"));
+	assert.strictEqual(settled.status, "done", "already-settled runs keep their status");
+	assert.deepStrictEqual(changed.map((r) => r.id), [running.id]);
+});
+
+test("reconcileRuns adopts a live working agent and resumes tracking", async () => {
+	const run = makeRun({ id: "sa-test-reconcile-live", status: "blocked", blockedQuestion: "old question" });
+	const summary = await reconcileRuns({
+		runs: [run],
+		liveAgents: [
+			{
+				agent: run.id,
+				name: run.id,
+				agent_status: "working",
+				pane_id: "%2",
+				tab_id: "tab-1",
+				workspace_id: "ws-1",
+			},
+		],
+		paneAlive: async () => true,
+	});
+
+	assert.deepStrictEqual(summary.adopted, [run.id]);
+	assert.strictEqual(run.status, "running");
+	assert.strictEqual(run.endedAt, undefined);
 });
