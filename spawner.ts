@@ -7,7 +7,7 @@
  * result. Pane mode lands in phase 2 behind the same request shape.
  *
  * Every child is spawned with:
- *   --no-extensions --no-skills -e <guard.ts>
+ *   --no-extensions --no-skills -e <guard.ts> -e <issues.ts>
  * and a sanitized environment (`HERDR_ENV=0`, all `HERDR_*` ids stripped), so
  * it cannot reach herdr or contact sibling agents.
  */
@@ -23,13 +23,16 @@ import type { Message } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type AgentConfig, isThinkingLevel } from "./agents.ts";
 import {
+	CLEAN_CHILD_ENV,
 	closePane,
 	getAgent,
+	getGeometrySplitDirection,
 	HerdrError,
 	isHerdrAvailable,
 	promptAgent,
 	resolveLayoutTarget,
 	sendKeys,
+	splitPane,
 	startAgent,
 } from "./herdr.ts";
 import { ISSUE_TOOL_NAMES } from "./issues.ts";
@@ -278,8 +281,13 @@ export function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv 
 }
 
 /** Child identity vars for the issue board (author attribution). */
-export function childIdentityEnv(run: SubagentRun, persona: AgentConfig): Record<string, string> {
-	return { PI_SUBAGENT_AGENT: persona.name, PI_SUBAGENT_ID: run.id };
+export function childIdentityEnv(persona: AgentConfig): Record<string, string> {
+	return { PI_SUBAGENT_AGENT: persona.name };
+}
+
+/** Sanitized env for a pane child: no herdr discovery, plus child identity. */
+export function paneChildEnv(persona: AgentConfig): Record<string, string> {
+	return { ...CLEAN_CHILD_ENV, ...childIdentityEnv(persona) };
 }
 
 /** Persona tool allowlist plus the shared issue tools (the sanctioned channel). */
@@ -429,7 +437,7 @@ export function startHeadless(options: HeadlessSpawnOptions): Promise<void> {
 			cwd: run.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: childEnv(childIdentityEnv(run, persona)),
+			env: childEnv(childIdentityEnv(persona)),
 		});
 
 		let buffer = "";
@@ -617,15 +625,36 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 	}
 
 	if (worktree?.paneId) {
-		// Herdr already opened a worktree workspace with a root pane.
+		// Herdr already opened a worktree workspace with a root pane, but
+		// `herdr worktree create` has no --env flag: that shell pane inherits
+		// Herdr's own environment (HERDR_ENV=1, live pane/workspace ids). Split a
+		// fresh pane with the sanitized child env instead, and close the root shell
+		// pane we created so the child runs with the same env hygiene as every
+		// other pane child.
 		run.paneId = worktree.paneId;
 		run.tabId = worktree.tabId;
+		const direction = await getGeometrySplitDirection(worktree.paneId);
+		const pane = await splitPane({
+			paneId: worktree.paneId,
+			direction,
+			cwd: run.cwd,
+			env: paneChildEnv(persona),
+			focus: false,
+		});
+		run.paneId = pane.pane_id;
+		run.tabId = pane.tab_id || worktree.tabId;
+		try {
+			await closePane(worktree.paneId);
+		} catch {
+			// Keep the id so `/subagents cleanup` and run.abort can retry closing it.
+			run.worktreeShellPaneId = worktree.paneId;
+		}
 	} else {
 		const target = await resolveLayoutTarget({
 			layout: worktree ? "auto" : layout,
 			cwd: run.cwd,
 			activePaneSubagentsCount: activePaneCount,
-			env: childIdentityEnv(run, persona),
+			env: paneChildEnv(persona),
 			workspaceId: worktree?.workspaceId,
 		});
 		run.paneId = target.paneId;
@@ -678,6 +707,14 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 			}
 		} catch {
 			/* ignore */
+		}
+		if (run.worktreeShellPaneId) {
+			try {
+				await closePane(run.worktreeShellPaneId);
+				run.worktreeShellPaneId = undefined;
+			} catch {
+				/* ignore; cleanup retries */
+			}
 		}
 		run.status = "aborted";
 		run.stopReason = reason ?? "aborted";

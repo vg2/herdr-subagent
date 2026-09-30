@@ -80,7 +80,7 @@ Sends a follow-up instruction to a running or blocked pane child. The child rece
   - `wait` (optional, default `true`): Wait until Herdr confirms the child is working on the message.
 
 ### `issue_create` / `issue_comment` / `issue_list` / `issue_get` / `issue_close`
-The shared cross-agent issue board. Uses `gh issue ...` when the project is a GitHub checkout with `gh` available; otherwise a durable file board at `<project>/.pi/issues/` (markdown + YAML frontmatter). The board always resolves to the main checkout, so worktree-isolated children share it. Titles follow `[<agent>] <summary>` (prefixed automatically), and status transitions (`open → in-progress → blocked → done`) are recorded with `issue_comment`/`issue_close`.
+The shared cross-agent issue board. Uses `gh issue ...` when the project is a GitHub checkout with `gh` available; otherwise a durable file board at `<project>/.pi/issues/` (markdown + YAML frontmatter). The board always resolves to the main checkout, so worktree-isolated children share it. Titles follow `[<agent>] <summary>` (prefixed automatically), and status transitions (`open → in-progress → blocked → done`) are recorded with `issue_comment`/`issue_close`: on GitHub a closed issue carries no stale `status:*` labels (the closed/open state itself represents done/open, reopening follows the transition), and `issue_create` with `status: "done"` closes the issue. Missing labels are created on demand (if they cannot be applied the issue is still created and the skip is reported), and agent-shaped assignees (e.g. `scout`) are reported as skipped on GitHub since assignees there must be GitHub logins.
 
 ---
 
@@ -92,7 +92,7 @@ User-facing command to inspect and control sub-agents:
 - `/subagents focus <id>`: Switch focus to a child's Herdr pane or tab.
 - `/subagents abort <id> [--force]`: Abort a sub-agent.
 - `/subagents collect [id]`: Harvest reports and usage.
-- `/subagents cleanup [--force] [--worktrees]`: Close completed child panes. `--worktrees` additionally removes each closed child's git worktree checkout (never done implicitly, since it can discard uncommitted work).
+- `/subagents cleanup [--force] [--worktrees]`: Close completed child panes and the Herdr workspaces the extension opened for them — the worktree workspace plus, when herdr had no workspace for the source checkout, the source-checkout workspace it opened. Source-checkout workspaces are opened one per checkout and shared by concurrent runs; a shared one is closed only once no run still needs it — no open pane, and no linked worktree workspace still holding panes (e.g. user-added panes). Workspaces still holding panes are kept. `--worktrees` additionally removes each closed child's git worktree checkout; checkouts with uncommitted changes are skipped and reported unless `--force` is given (which discards them).
 
 ---
 

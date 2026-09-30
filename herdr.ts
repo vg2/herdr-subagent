@@ -109,7 +109,10 @@ export const CLEAN_CHILD_ENV: Record<string, string> = {
 export function isNotFoundError(err: unknown): boolean {
 	return (
 		err instanceof HerdrError &&
-		(err.code === "agent_not_found" || err.code === "pane_not_found" || err.code === "tab_not_found")
+		(err.code === "agent_not_found" ||
+			err.code === "pane_not_found" ||
+			err.code === "tab_not_found" ||
+			err.code === "workspace_not_found")
 	);
 }
 
@@ -293,6 +296,53 @@ export async function focusTab(tabId: string): Promise<void> {
 
 export async function closeTab(tabId: string): Promise<void> {
 	await herdrExec(["tab", "close", tabId]);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace operations
+// ---------------------------------------------------------------------------
+
+export async function listWorkspaces(): Promise<WorkspaceInfo[]> {
+	const res = await herdrExec<{ workspaces: WorkspaceInfo[] }>(["workspace", "list"]);
+	return res.workspaces ?? [];
+}
+
+export async function closeWorkspace(workspaceId: string): Promise<void> {
+	await herdrExec(["workspace", "close", workspaceId]);
+}
+
+export interface CreateWorkspaceOptions {
+	cwd?: string;
+	label?: string;
+	env?: Record<string, string>;
+	focus?: boolean;
+}
+
+/**
+ * Create a workspace. Used to open the source checkout of a worktree run
+ * explicitly, so the extension knows which workspace it owns and can close it
+ * later (herdr's `worktree create --cwd` would open it implicitly and leave it
+ * untracked).
+ */
+export async function createWorkspace(
+	options: CreateWorkspaceOptions = {},
+): Promise<{ workspace: WorkspaceInfo; tab: TabInfo; rootPane: PaneInfo }> {
+	const args = ["workspace", "create"];
+	if (options.cwd) args.push("--cwd", options.cwd);
+	if (options.label) args.push("--label", options.label);
+	if (options.env) {
+		for (const [key, value] of Object.entries(options.env)) {
+			args.push("--env", `${key}=${value}`);
+		}
+	}
+	if (options.focus) args.push("--focus");
+	else args.push("--no-focus");
+
+	const res = await herdrExec<{ workspace: WorkspaceInfo; tab: TabInfo; root_pane: PaneInfo }>(args);
+	if (!res.workspace || !res.tab || !res.root_pane) {
+		throw new Error("herdr workspace create did not return a workspace, tab, and root_pane");
+	}
+	return { workspace: res.workspace, tab: res.tab, rootPane: res.root_pane };
 }
 
 // ---------------------------------------------------------------------------

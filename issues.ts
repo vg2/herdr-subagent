@@ -70,7 +70,7 @@ export type Tracker =
 	| { kind: "file"; root: string; boardDir: string };
 
 export interface IssueToolDetails {
-	tracker: "github" | "file";
+	tracker?: "github" | "file";
 	id?: string;
 	count?: number;
 	error?: string;
@@ -108,6 +108,16 @@ export function normalizeStatus(value: unknown): IssueStatus {
 	return typeof value === "string" && (ISSUE_STATUSES as readonly string[]).includes(value)
 		? (value as IssueStatus)
 		: "open";
+}
+
+/**
+ * Whether a status is represented by a `status:<state>` label. `open` is the
+ * default state and `done` is represented by the closed issue itself, so only
+ * the active in-between states carry a label (shared by issue_create and
+ * applyGhStatus so both paths agree).
+ */
+export function wantStatusLabel(status: IssueStatus): boolean {
+	return status !== "done" && status !== "open";
 }
 
 /**
@@ -417,13 +427,211 @@ function ghArgs(root: string, args: string[]): string[] {
 async function gh(
 	root: string,
 	args: string[],
-	options: { input?: string } = {},
+	options: { input?: string; run?: CommandRunner } = {},
 ): Promise<CommandResult> {
-	return defaultRunner("gh", ghArgs(root, args), { cwd: root, input: options.input });
+	return (options.run ?? defaultRunner)("gh", ghArgs(root, args), { cwd: root, input: options.input });
 }
 
-async function ensureGhStatusLabel(root: string, status: IssueStatus): Promise<void> {
-	await gh(root, ["label", "create", `status:${status}`, "--color", "ededed", "--force"]);
+interface GhLabelJson {
+	name: string;
+}
+
+/**
+ * Ensure each label exists on the repository. `gh issue create` fails the whole
+ * issue when a label is missing, and agent-shaped labels (e.g. `agent:scout`)
+ * are normally new, so the board creates them on demand. Existing labels are
+ * left untouched (checked first, no `--force`) so repository colors survive.
+ */
+export async function ensureGhLabels(
+	root: string,
+	names: string[],
+	run: CommandRunner = defaultRunner,
+): Promise<string | null> {
+	const unique = Array.from(new Set(names.map((n) => n.trim()).filter(Boolean)));
+	if (unique.length === 0) return null;
+
+	const existing = new Set<string>();
+	const listed = await gh(root, ["label", "list", "--limit", "200", "--json", "name"], { run });
+	if (listed.code === 0) {
+		try {
+			for (const label of JSON.parse(listed.stdout || "[]") as GhLabelJson[]) existing.add(label.name);
+		} catch {
+			/* fall through to create-and-recheck */
+		}
+	}
+
+	for (const name of unique) {
+		if (existing.has(name)) continue;
+		const created = await gh(root, ["label", "create", name, "--color", "ededed"], { run });
+		if (created.code !== 0) {
+			// Race, or the label exists beyond the list limit: verify before failing.
+			let found = false;
+			const recheck = await gh(
+				root,
+				["label", "list", "--search", name, "--limit", "50", "--json", "name"],
+				{ run },
+			);
+			if (recheck.code === 0) {
+				try {
+					found = (JSON.parse(recheck.stdout || "[]") as GhLabelJson[]).some((l) => l.name === name);
+				} catch {
+					/* ignore */
+				}
+			}
+			if (!found) return created.stderr.trim() || `could not create label "${name}"`;
+		}
+		existing.add(name);
+	}
+	return null;
+}
+
+export interface GhCreateIssueInput {
+	title: string;
+	body: string;
+	labels: string[];
+	assignee?: string;
+}
+
+export interface GhCreateIssueResult {
+	result: CommandResult;
+	/** Set when the initial attempt failed and the no-assignee retry succeeded. */
+	assigneeSkipped?: string;
+	/** Error of the first (assignee) attempt, kept so the skip/failure reason is accurate. */
+	assigneeError?: string;
+	/** True when both attempts failed; `result` is then the no-assignee attempt. */
+	retriedWithoutAssignee?: boolean;
+}
+
+/**
+ * Create a GitHub issue. Assignees must be real GitHub logins, so an
+ * agent-shaped name (e.g. "scout") would fail the entire create; in that case
+ * the issue is retried without the assignee and the caller reports the skip,
+ * together with the original error so an unrelated failure is not mislabeled.
+ */
+export async function ghCreateIssue(
+	root: string,
+	input: GhCreateIssueInput,
+	run: CommandRunner = defaultRunner,
+): Promise<GhCreateIssueResult> {
+	const base = [
+		"issue",
+		"create",
+		"--title",
+		input.title,
+		"--body-file",
+		"-",
+		...input.labels.flatMap((label) => ["--label", label]),
+	];
+	const attempt = (assignee?: string) => {
+		const args = [...base];
+		if (assignee) args.push("--assignee", assignee);
+		return gh(root, args, { input: input.body, run });
+	};
+
+	const result = await attempt(input.assignee);
+	if (result.code === 0 || !input.assignee) return { result };
+
+	const assigneeError = result.stderr.trim() || "gh issue create failed";
+	const retry = await attempt(undefined);
+	if (retry.code === 0) return { result: retry, assigneeSkipped: input.assignee, assigneeError };
+	return { result: retry, assigneeError, retriedWithoutAssignee: true };
+}
+
+interface GhIssueStateJson {
+	state?: string;
+	labels?: GhLabelJson[];
+}
+
+async function ghStatusLabels(
+	root: string,
+	id: string,
+	run: CommandRunner,
+): Promise<{ state?: string; labels: string[] } | null> {
+	const res = await gh(root, ["issue", "view", id, "--json", "state,labels"], { run });
+	if (res.code !== 0) return null;
+	try {
+		const data = JSON.parse(res.stdout || "{}") as GhIssueStateJson;
+		return {
+			state: data.state,
+			labels: (data.labels ?? []).map((l) => l.name).filter((name) => name.startsWith("status:")),
+		};
+	} catch {
+		return null;
+	}
+}
+
+export interface GhStatusResult {
+	/** The transition itself failed (edit/close/reopen); nothing reliable applied. */
+	error?: string;
+	/**
+	 * The transition applied, but the `status:<state>` label could not be created
+	 * or applied (e.g. no triage permission). Displayed status falls back to
+	 * `open`, mirroring `issue_create`'s label fallback instead of failing the
+	 * whole transition.
+	 */
+	warning?: string;
+}
+
+/**
+ * Record a status transition on a GitHub issue. `done` is represented by the
+ * closed state (every `status:*` label is removed, then the issue is closed)
+ * and `open` by the absence of a status label, matching `issue_create`; the
+ * active in-between states carry `status:<state>` with every stale label
+ * removed. An issue moved from closed back to an active state is reopened.
+ *
+ * Label-creation failures are reported as a `warning` rather than aborting the
+ * transition, so the comment or close the caller already made is not reported
+ * as failed and stale labels are still cleaned up.
+ */
+export async function applyGhStatus(
+	root: string,
+	id: string,
+	status: IssueStatus,
+	run: CommandRunner = defaultRunner,
+): Promise<GhStatusResult> {
+	const current = await ghStatusLabels(root, id, run);
+	const statusLabels = current?.labels ?? [];
+	const target = `status:${status}`;
+	// done/open are represented by the issue state itself, so every status label
+	// is stale; active states keep the target label and drop the rest.
+	const wantLabel = wantStatusLabel(status);
+	const stale = statusLabels.filter((name) => name !== target || !wantLabel);
+
+	if (status === "done") {
+		if (stale.length > 0) {
+			const res = await gh(
+				root,
+				["issue", "edit", id, ...stale.flatMap((label) => ["--remove-label", label])],
+				{ run },
+			);
+			if (res.code !== 0) return { error: res.stderr.trim() || "gh issue edit failed" };
+		}
+		// Already closed: idempotent, and the stale labels above are still gone.
+		if (current?.state?.toLowerCase() === "closed") return {};
+		const res = await gh(root, ["issue", "close", id], { run });
+		return res.code === 0 ? {} : { error: res.stderr.trim() || "gh issue close failed" };
+	}
+
+	const addLabel = wantLabel && !statusLabels.includes(target);
+	let warning: string | undefined;
+	if (addLabel) {
+		const labelError = await ensureGhLabels(root, [target], run);
+		if (labelError) warning = `status label "${target}" was not applied (${labelError})`;
+	}
+
+	const args = ["issue", "edit", id];
+	if (addLabel && !warning) args.push("--add-label", target);
+	for (const label of stale) args.push("--remove-label", label);
+	if (args.length > 3) {
+		const res = await gh(root, args, { run });
+		if (res.code !== 0) return { error: res.stderr.trim() || "gh issue edit failed" };
+	}
+
+	if (current?.state?.toLowerCase() === "closed") {
+		const res = await gh(root, ["issue", "reopen", id], { run });
+		if (res.code !== 0) return { error: res.stderr.trim() || "gh issue reopen failed" };
+	}
+	return warning ? { warning } : {};
 }
 
 interface GhIssueJson {
@@ -547,7 +755,7 @@ function ok(text: string, details: IssueToolDetails) {
 	return { content: [{ type: "text" as const, text }], details };
 }
 
-function fail(text: string, details: IssueToolDetails = { tracker: "file" }) {
+function fail(text: string, details: IssueToolDetails = {}) {
 	return { content: [{ type: "text" as const, text }], details: { ...details, error: text }, isError: true };
 }
 
@@ -599,7 +807,13 @@ export function registerIssueTools(pi: ExtensionAPI): void {
 			title: Type.String({ description: "Issue summary (the `[<agent>]` prefix is added automatically)." }),
 			body: Type.String({ description: "Task, findings, and artifact paths. Markdown is fine." }),
 			labels: Type.Optional(Type.Array(Type.String(), { description: "Labels to apply." })),
-			assignee: Type.Optional(Type.String({ description: "Agent or user responsible for the issue." })),
+			assignee: Type.Optional(
+				Type.String({
+					description:
+						"Agent or user responsible for the issue. On GitHub checkouts the value must be an existing " +
+						"GitHub login; agent-shaped names are recorded on the file board and reported as skipped on GitHub.",
+				}),
+			),
 			status: StatusSchema,
 			agent: Type.Optional(
 				Type.String({ description: "Author name override. Defaults to the sub-agent name, or `parent`." }),
@@ -614,26 +828,74 @@ export function registerIssueTools(pi: ExtensionAPI): void {
 			try {
 				const tracker = await resolveTracker(ctx.cwd);
 				if (tracker.kind === "github") {
-					const labels = [...(params.labels ?? [])];
-					if (status !== "open") {
-						await ensureGhStatusLabel(tracker.root, status);
-						labels.push(`status:${status}`);
+					const labels = [...new Set(params.labels ?? [])];
+					const statusLabel = `status:${status}`;
+					// done is represented by the closed state and open by the absence of a
+					// status label (see applyGhStatus); only active states get a label.
+					if (wantStatusLabel(status) && !labels.includes(statusLabel)) labels.push(statusLabel);
+
+					// Labels that cannot be created (e.g. no triage permission) must not
+					// sink the whole issue. Create with the ones that do apply and report
+					// the rest, mirroring the assignee fallback below.
+					let effectiveLabels = labels;
+					let labelWarning = await ensureGhLabels(tracker.root, labels);
+					if (labelWarning) {
+						// One bad label must not drop the others: retry individually and
+						// keep every label that can be applied.
+						effectiveLabels = [];
+						const unapplied: string[] = [];
+						for (const label of labels) {
+							if ((await ensureGhLabels(tracker.root, [label])) === null) effectiveLabels.push(label);
+							else unapplied.push(label);
+						}
+						labelWarning = unapplied.join(", ");
 					}
-					const args = [
-						"issue",
-						"create",
-						"--title",
-						title,
-						"--body-file",
-						"-",
-						...labels.flatMap((label) => ["--label", label]),
-					];
-					if (params.assignee) args.push("--assignee", params.assignee);
-					const res = await gh(tracker.root, args, { input: params.body });
-					if (res.code !== 0) return fail(res.stderr.trim() || "gh issue create failed", { tracker: "github" });
-					const id = res.stdout.match(/\/issues\/(\d+)/)?.[1];
-					const url = res.stdout.trim().split("\n").pop() ?? "";
-					return ok(`Created issue #${id ?? "?"}: ${title}${url ? `\n${url}` : ""}`, {
+
+					const { result, assigneeSkipped, assigneeError, retriedWithoutAssignee } = await ghCreateIssue(
+						tracker.root,
+						{
+							title,
+							body: params.body,
+							labels: effectiveLabels,
+							assignee: params.assignee,
+						},
+					);
+					if (result.code !== 0) {
+						let msg = result.stderr.trim() || "gh issue create failed";
+						if (retriedWithoutAssignee) {
+							msg += `\n(retry without the assignee also failed; first attempt: ${assigneeError})`;
+						}
+						return fail(msg, { tracker: "github" });
+					}
+					const id = result.stdout.match(/\/issues\/(\d+)/)?.[1];
+					const url = result.stdout.trim().split("\n").pop() ?? "";
+
+					if (status === "done" && id) {
+						const closeResult = await applyGhStatus(tracker.root, id, "done");
+						if (closeResult.error) {
+							return fail(`Created issue #${id} but closing it as done failed: ${closeResult.error}`, {
+								tracker: "github",
+								id,
+							});
+						}
+					}
+
+					const notes: string[] = [];
+					if (labelWarning) notes.push(`labels not applied: ${labelWarning}`);
+					if (status === "done" && !id) {
+						notes.push("could not determine the issue number to close it; close it manually");
+					}
+					if (assigneeSkipped) {
+						notes.push(
+							`assignee "${assigneeSkipped}" was not applied (first attempt failed: ${assigneeError ?? "unknown error"}); ` +
+								"GitHub assignees must be GitHub logins — use labels for agent assignment",
+						);
+					}
+					const suffix = notes.length > 0 ? `\n(${notes.join("; ")})` : "";
+					// Only claim it was closed when the issue number was known and the close
+					// actually ran; otherwise the note above explains the fallback.
+					const closed = status === "done" && id ? " (closed as done)" : "";
+					return ok(`Created issue #${id ?? "?"}: ${title}${closed}${url ? `\n${url}` : ""}${suffix}`, {
 						tracker: "github",
 						id,
 					});
@@ -683,18 +945,27 @@ export function registerIssueTools(pi: ExtensionAPI): void {
 						input: params.body,
 					});
 					if (res.code !== 0) return fail(res.stderr.trim() || "gh issue comment failed", { tracker: "github" });
+					let statusNote = "";
+					let appliedStatus = status;
 					if (status) {
-						if (status === "done") {
-							await gh(tracker.root, ["issue", "close", params.id]);
-						} else {
-							await ensureGhStatusLabel(tracker.root, status);
-							await gh(tracker.root, ["issue", "edit", params.id, "--add-label", `status:${status}`]);
+						const statusResult = await applyGhStatus(tracker.root, params.id, status);
+						if (statusResult.error) {
+							return fail(
+								`Comment posted, but the status transition to "${status}" failed: ${statusResult.error}`,
+								{ tracker: "github", id: params.id },
+							);
+						}
+						if (statusResult.warning) {
+							statusNote = `\n(${statusResult.warning})`;
+							// The label could not be applied, so the effective status is
+							// open; report what was applied, not what was requested.
+							appliedStatus = "open";
 						}
 					}
-					return ok(`Commented on issue #${params.id}${status ? ` (status: ${status})` : ""}.`, {
-						tracker: "github",
-						id: params.id,
-					});
+					return ok(
+						`Commented on issue #${params.id}${status ? ` (status: ${appliedStatus})` : ""}.${statusNote}`,
+						{ tracker: "github", id: params.id },
+					);
 				}
 
 				const updated = addFileIssueComment(tracker.boardDir, params.id, { body: params.body, author, status });
@@ -822,11 +1093,23 @@ export function registerIssueTools(pi: ExtensionAPI): void {
 			try {
 				const tracker = await resolveTracker(ctx.cwd);
 				if (tracker.kind === "github") {
-					const args = ["issue", "close", params.id];
-					if (params.comment?.trim()) args.push("--comment", params.comment.trim());
-					const res = await gh(tracker.root, args);
-					if (res.code !== 0) return fail(res.stderr.trim() || "gh issue close failed", { tracker: "github" });
-					return ok(`Closed issue #${params.id}.`, { tracker: "github", id: params.id });
+					if (params.comment?.trim()) {
+						const res = await gh(tracker.root, ["issue", "comment", params.id, "--body-file", "-"], {
+							input: params.comment,
+						});
+						if (res.code !== 0) return fail(res.stderr.trim() || "gh issue comment failed", { tracker: "github" });
+					}
+					// Route through applyGhStatus so closing strips stale status:* labels
+					// and is idempotent on an already-closed issue.
+					const statusResult = await applyGhStatus(tracker.root, params.id, "done");
+					if (statusResult.error) {
+						const prefix = params.comment?.trim() ? "Comment posted, but closing failed: " : "";
+						return fail(`${prefix}${statusResult.error}`, { tracker: "github", id: params.id });
+					}
+					// Unreachable for "done" today (no status label is applied), but the
+					// warning is surfaced rather than dropped if that ever changes.
+					const closeNote = statusResult.warning ? `\n(${statusResult.warning})` : "";
+					return ok(`Closed issue #${params.id}.${closeNote}`, { tracker: "github", id: params.id });
 				}
 
 				const closed = closeFileIssue(tracker.boardDir, params.id, { comment: params.comment, author });

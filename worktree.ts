@@ -14,7 +14,16 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { createWorktree as herdrCreateWorktree, isHerdrAvailable, listPanes } from "./herdr.ts";
+import {
+	closeWorkspace,
+	createWorkspace,
+	createWorktree as herdrCreateWorktree,
+	isHerdrAvailable,
+	isNotFoundError,
+	listPanes,
+	listWorkspaces,
+} from "./herdr.ts";
+import type { SourceWorkspace } from "./state.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,6 +37,10 @@ export interface PreparedWorktree {
 	paneId?: string;
 	tabId?: string;
 	workspaceId?: string;
+	/** Workspace herdr linked the worktree workspace to (parent, reused, or created). */
+	sourceWorkspaceId?: string;
+	/** Set only when this run opened the source workspace itself; cleanup closes it. */
+	ownedSourceWorkspace?: SourceWorkspace;
 }
 
 async function git(
@@ -102,11 +115,37 @@ export async function createGitWorktree(options: {
 	return dir;
 }
 
-/** Remove a worktree checkout. Callers must opt in explicitly (destructive). */
-export async function removeGitWorktree(worktreePath: string): Promise<void> {
-	const root = await gitRepoRoot(worktreePath);
+/**
+ * Main checkout root of the repository that owns `cwd`, when it can be
+ * determined. Used so `git worktree remove` never runs with its cwd inside the
+ * checkout it is deleting. Returns null for unusual layouts (e.g. bare repos),
+ * where callers fall back to the worktree's own root.
+ */
+async function commonRepoRoot(cwd: string): Promise<string | null> {
+	const res = await git(["rev-parse", "--git-common-dir"], cwd);
+	if (res.code !== 0 || !res.stdout.trim()) return null;
+	const raw = res.stdout.trim();
+	const abs = path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
+	return path.basename(abs) === ".git" ? path.dirname(abs) : null;
+}
+
+/**
+ * Remove a worktree checkout. Without `force`, git refuses when the checkout
+ * contains modified or untracked files, so a child's uncommitted work is never
+ * discarded silently; callers surface that as "skipped" and require an explicit
+ * force to delete it. The command runs from the main checkout, not from inside
+ * the checkout being removed.
+ */
+export async function removeGitWorktree(
+	worktreePath: string,
+	options: { force?: boolean } = {},
+): Promise<void> {
+	const root = (await commonRepoRoot(worktreePath)) ?? (await gitRepoRoot(worktreePath));
 	if (!root) throw new Error(`Not a git worktree: ${worktreePath}`);
-	const res = await git(["worktree", "remove", "--force", worktreePath], root);
+	let res = await git(["worktree", "remove", worktreePath], root);
+	if (res.code !== 0 && options.force) {
+		res = await git(["worktree", "remove", "--force", worktreePath], root);
+	}
 	if (res.code !== 0) {
 		throw new Error(res.stderr.trim() || "git worktree remove failed");
 	}
@@ -122,26 +161,115 @@ export interface PrepareWorktreeOptions {
 }
 
 /**
- * The parent session's workspace id when it belongs to the same repository.
- * Passing it to `herdr worktree create` avoids herdr opening a second workspace
- * for the source checkout when `--cwd` is used instead.
+ * The parent session's own workspace when it shows `repoRoot`: the pane the
+ * parent runs in, or else the workspace's own checkout. Never scans for or
+ * adopts other sessions' workspaces — a foreign owner's cleanup could close a
+ * shared source workspace (cascading to this run's worktree workspace)
+ * without knowing about this run's panes. This extension only links worktrees
+ * to workspaces it can account for: the parent's own, or one it opened itself.
  */
 async function parentWorkspaceForRepo(repoRoot: string): Promise<string | undefined> {
 	const workspaceId = process.env.HERDR_WORKSPACE_ID;
+	if (!workspaceId) return undefined;
 	const paneId = process.env.HERDR_PANE_ID;
-	if (!workspaceId || !paneId) return undefined;
+	if (paneId) {
+		try {
+			const panes = await listPanes(workspaceId);
+			const pane = panes.find((p) => p.pane_id === paneId);
+			const parentCwd = pane?.foreground_cwd || pane?.cwd;
+			if (parentCwd) {
+				const parentRoot = await gitRepoRoot(parentCwd);
+				if (parentRoot && parentRoot === repoRoot) return workspaceId;
+			}
+		} catch {
+			/* fall through to the workspace's own checkout */
+		}
+	}
 
 	try {
-		const panes = await listPanes(workspaceId);
-		const pane = panes.find((p) => p.pane_id === paneId);
-		const parentCwd = pane?.foreground_cwd || pane?.cwd;
-		if (!parentCwd) return undefined;
-		const parentRoot = await gitRepoRoot(parentCwd);
-		if (parentRoot && parentRoot === repoRoot) return workspaceId;
+		const target = path.resolve(repoRoot);
+		const ws = (await listWorkspaces()).find((w) => w.workspace_id === workspaceId);
+		const checkout = ws?.worktree?.checkout_path ?? ws?.worktree?.path;
+		if (checkout && path.resolve(checkout) === target) return workspaceId;
 	} catch {
-		/* fall back to --cwd */
+		/* fall back to opening a workspace explicitly */
 	}
 	return undefined;
+}
+
+/** A source-checkout workspace this process opened, keyed by repo root. */
+interface TrackedSourceWorkspace {
+	/** Creation in flight (or settled): concurrent runs await the same promise. */
+	promise: Promise<SourceWorkspace>;
+	/** Set once creation settles, so a closed workspace can be forgotten by id. */
+	workspaceId?: string;
+}
+
+const sourceWorkspaces = new Map<string, TrackedSourceWorkspace>();
+
+/**
+ * The source-checkout workspace for `repoRoot`, opening one when needed.
+ * Concurrent worktree runs (the point of `layout: "worktree"`) share a single
+ * workspace — one `workspace create`, one visible source workspace per
+ * checkout — instead of racing to open one each; only the run whose call
+ * created it owns closing it.
+ */
+async function openSourceWorkspace(
+	repoRoot: string,
+	runId: string,
+): Promise<{ workspaceId: string; owned?: SourceWorkspace }> {
+	const key = path.resolve(repoRoot);
+	const existing = sourceWorkspaces.get(key);
+	if (existing) {
+		// Shared: the creating run owns it; cleanup keeps it while this run's panes are open.
+		const shared = await existing.promise;
+		return { workspaceId: shared.workspaceId };
+	}
+	const entry: TrackedSourceWorkspace = { promise: null as unknown as Promise<SourceWorkspace> };
+	const promise = createWorkspace({
+		cwd: repoRoot,
+		label: `subagent source ${runId}`,
+		focus: false,
+	}).then((created) => {
+		const owned: SourceWorkspace = {
+			workspaceId: created.workspace.workspace_id,
+			paneIds: [created.rootPane.pane_id],
+		};
+		entry.workspaceId = owned.workspaceId;
+		return owned;
+	});
+	entry.promise = promise;
+	sourceWorkspaces.set(key, entry);
+	// Drop a failed creation so a later run retries instead of inheriting a rejected promise.
+	promise.catch(() => {
+		if (sourceWorkspaces.get(key) === entry) sourceWorkspaces.delete(key);
+	});
+	const owned = await promise;
+	return { workspaceId: owned.workspaceId, owned };
+}
+
+/**
+ * Forget a tracked source workspace once it is closed (by cleanup or the git
+ * fallback), so later runs do not reuse a stale workspace id after a manual
+ * close, and concurrent reuse stops once the workspace is really gone.
+ */
+export function forgetSourceWorkspace(workspaceId: string): void {
+	for (const [key, entry] of sourceWorkspaces) {
+		if (entry.workspaceId === workspaceId) {
+			sourceWorkspaces.delete(key);
+			return;
+		}
+	}
+}
+
+/** Whether a workspace still exists per herdr (unknown errors conservatively say yes). */
+async function sourceWorkspaceAlive(workspaceId: string): Promise<boolean> {
+	try {
+		await listPanes(workspaceId);
+		return true;
+	} catch (err) {
+		return !isNotFoundError(err);
+	}
 }
 
 /**
@@ -160,11 +288,23 @@ export async function prepareWorktree(options: PrepareWorktreeOptions): Promise<
 	const branch = await uniqueBranch(repoRoot, `pi-subagent/${runId}`);
 
 	if (preferHerdr && isHerdrAvailable()) {
+		let sourceWorkspaceId: string | undefined;
+		let ownedSourceWorkspace: SourceWorkspace | undefined;
 		try {
-			const workspaceId = await parentWorkspaceForRepo(repoRoot);
+			// `herdr worktree create --cwd` opens a source-checkout workspace as a
+			// side effect and links the worktree to it; that workspace is invisible to
+			// cleanup and leaks. Link to the parent's own workspace when it shows the
+			// checkout, or to one this process opened (sharing it with concurrent
+			// runs), or open one explicitly so this run owns it — never to a foreign
+			// workspace nobody here can account for.
+			sourceWorkspaceId = await parentWorkspaceForRepo(repoRoot);
+			if (!sourceWorkspaceId) {
+				const source = await openSourceWorkspace(repoRoot, runId);
+				sourceWorkspaceId = source.workspaceId;
+				ownedSourceWorkspace = source.owned;
+			}
 			const res = await herdrCreateWorktree({
-				workspaceId,
-				cwd: workspaceId ? undefined : repoRoot,
+				workspaceId: sourceWorkspaceId,
 				branch,
 				base,
 				label: label ?? runId,
@@ -179,8 +319,24 @@ export async function prepareWorktree(options: PrepareWorktreeOptions): Promise<
 				paneId: res.rootPane.pane_id,
 				tabId: res.tab.tab_id,
 				workspaceId: res.workspace.workspace_id,
+				sourceWorkspaceId,
+				ownedSourceWorkspace,
 			};
 		} catch (herdrErr: any) {
+			// A source workspace we opened for a worktree that then failed would be
+			// stranded, so close it (and forget it) before falling back to git. A
+			// shared one is kept — other runs still use it — but is forgotten when
+			// herdr says it is already gone, so later runs do not reuse a stale id.
+			if (ownedSourceWorkspace) {
+				try {
+					await closeWorkspace(ownedSourceWorkspace.workspaceId);
+					forgetSourceWorkspace(ownedSourceWorkspace.workspaceId);
+				} catch (err) {
+					if (isNotFoundError(err)) forgetSourceWorkspace(ownedSourceWorkspace.workspaceId);
+				}
+			} else if (sourceWorkspaceId && !(await sourceWorkspaceAlive(sourceWorkspaceId))) {
+				forgetSourceWorkspace(sourceWorkspaceId);
+			}
 			const dir = uniquePath(defaultGitWorktreePath(repoRoot, runId));
 			try {
 				await createGitWorktree({ repoRoot, dir, branch, base });

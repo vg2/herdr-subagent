@@ -84,6 +84,30 @@ test("prepareWorktree without herdr creates and removes a plain git worktree", a
 	}
 });
 
+test("removeGitWorktree keeps uncommitted work unless force is set", async (t) => {
+	if (!gitAvailable()) return t.skip("git not available");
+
+	const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-wt-dirty-"));
+	const repo = path.join(parent, "repo");
+	fs.mkdirSync(repo);
+	initRepo(repo);
+
+	try {
+		const prepared = await prepareWorktree({ cwd: repo, runId: "sa-worker-dirty", preferHerdr: false });
+		fs.writeFileSync(path.join(prepared.path, "uncommitted.txt"), "work in progress\n");
+
+		// Without force, git refuses (dirty checkout) and the file survives.
+		await assert.rejects(() => removeGitWorktree(prepared.path), /modified or untracked|uncommitted/i);
+		assert.ok(fs.existsSync(path.join(prepared.path, "uncommitted.txt")));
+
+		// With force, the checkout is removed.
+		await removeGitWorktree(prepared.path, { force: true });
+		assert.ok(!fs.existsSync(prepared.path), "worktree should be removed with force");
+	} finally {
+		fs.rmSync(parent, { recursive: true, force: true });
+	}
+});
+
 test("createGitWorktree refuses to reuse an existing branch untouched and uniqueBranch suffixes", async (t) => {
 	if (!gitAvailable()) return t.skip("git not available");
 

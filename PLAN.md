@@ -432,7 +432,7 @@ reconstructed on `session_start` from the branch (`ctx.sessionManager.getBranch(
     *(Done: `ctx.ui.setStatus("herdr-subagent", …)` line plus the `subagent_message` tool for pane children; headless children are rejected with a clear message.)*
 11. Chain/parallel sugar (optional; the parent can do it with multiple
     spawns), write-parallel worktree layout.
-    *(Worktree layout done (`layout: "worktree"`, herdr workspace when available, plain `git worktree add` fallback). Chain/parallel sugar intentionally skipped: multiple `spawn_subagent` calls already run in parallel and `wait: true` covers sequential flows.)*
+    *(Worktree layout done (`layout: "worktree"`, herdr workspace when available, plain `git worktree add` fallback). Because `herdr worktree create` has no `--env` flag, the worktree root pane is split into a sanitized child pane (`HERDR_ENV=0` + identity) and the shell root is closed. `cleanup --worktrees` only deletes clean checkouts; dirty ones are skipped and reported unless `--force` is given. Chain/parallel sugar intentionally skipped: multiple `spawn_subagent` calls already run in parallel and `wait: true` covers sequential flows.)*
 12. Selective-delegation guidance: finalize tool descriptions + a
     guidelines section injected via `before_agent_start` so the model
     delegates by policy, not eagerness (includes the model-selection

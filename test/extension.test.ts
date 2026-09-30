@@ -1,10 +1,18 @@
 import test from "node:test";
 import assert from "node:assert";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import extensionFactory from "../index.ts";
-import { closePane, isHerdrAvailable } from "../herdr.ts";
+import {
+	closePane,
+	closeWorkspace,
+	isHerdrAvailable,
+	listWorkspaces,
+	splitPane,
+} from "../herdr.ts";
+import { removeGitWorktree } from "../worktree.ts";
 
 function createMockExtensionAPI() {
 	const tools = new Map<string, any>();
@@ -422,4 +430,259 @@ test("manually closed pane is reconciled and cleanup handles pane_not_found", as
 	}
 	assert.strictEqual(view.status, "done");
 	assert.strictEqual(view.paneClosed, true);
+});
+
+test("cleanup closes the herdr worktree workspace and removes its checkout", async (t) => {
+	if (!isHerdrAvailable()) return;
+	try {
+		execFileSync("git", ["--version"], { stdio: "ignore" });
+	} catch {
+		return t.skip("git not available");
+	}
+
+	const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-ext-wt-cleanup-"));
+	const repo = path.join(parent, "repo");
+	fs.mkdirSync(repo);
+	execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+	fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+	execFileSync("git", ["add", "."], { cwd: repo });
+	execFileSync("git", ["-c", "user.email=test@test", "-c", "user.name=test", "commit", "-qm", "init"], {
+		cwd: repo,
+	});
+
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext({ mode: "tui" });
+	const spawnTool = api.tools.get("spawn_subagent");
+	const abortTool = api.tools.get("abort_subagent");
+	const subagentsCmd = api.commands.get("subagents");
+
+	let run: any;
+	let workspaceId: string | undefined;
+	let sourceWorkspaceId: string | undefined;
+	try {
+		const res = await spawnTool.execute(
+			"call-spawn-wt-cleanup",
+			{
+				agent: "scout",
+				task: "Reply with the single word: ready",
+				mode: "pane",
+				layout: "worktree",
+				cwd: repo,
+				wait: false,
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		run = res.details.runs[0];
+		assert.strictEqual(res.isError, undefined, res.content[0].text);
+		if (run.worktreeMode !== "herdr") return t.skip("herdr worktree create unavailable");
+
+		workspaceId = run.workspaceId;
+		sourceWorkspaceId = run.ownedSourceWorkspace?.workspaceId;
+		assert.ok(workspaceId, "worktree run should record its herdr workspace");
+		assert.ok(sourceWorkspaceId, "worktree run should own the source workspace it opened");
+		assert.ok(fs.existsSync(run.worktreePath), "worktree checkout should exist before cleanup");
+
+		await subagentsCmd.handler("cleanup --force --worktrees", ctx);
+		assert.ok(
+			ctx.notifications.some((n: any) => n.msg.includes("worktree workspace(s)")),
+			`expected the workspace close in the cleanup message, got: ${JSON.stringify(ctx.notifications)}`,
+		);
+		assert.ok(
+			ctx.notifications.some((n: any) => n.msg.includes("source-checkout workspace(s)")),
+			`expected the source workspace close in the cleanup message, got: ${JSON.stringify(ctx.notifications)}`,
+		);
+		assert.ok(!fs.existsSync(run.worktreePath), "worktree checkout should be removed with --worktrees --force");
+
+		for (let i = 0; i < 20; i++) {
+			const open = (await listWorkspaces()).map((w) => w.workspace_id);
+			if (!open.includes(workspaceId!) && !open.includes(sourceWorkspaceId!)) break;
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		const remaining = (await listWorkspaces()).map((w) => w.workspace_id);
+		assert.ok(
+			!remaining.includes(workspaceId!),
+			"extension-created worktree workspace should be closed by cleanup",
+		);
+		assert.ok(
+			!remaining.includes(sourceWorkspaceId!),
+			"extension-created source-checkout workspace should be closed by cleanup",
+		);
+	} finally {
+		if (run) {
+			try {
+				await abortTool.execute("call-abort-wt-cleanup", { id: run.id, force: true }, undefined, undefined, ctx);
+			} catch {
+				/* ignore */
+			}
+		}
+		// The extension opens the source-checkout workspace explicitly for a
+		// worktree run; cleanup should close it, but close anything left pointing
+		// into the temp dir (plus the tracked workspaces) if cleanup failed.
+		try {
+			const tempRoot = path.resolve(parent);
+			for (const ws of await listWorkspaces()) {
+				const checkout = ws.worktree?.checkout_path ?? ws.worktree?.path;
+				const underTemp = !!checkout && path.resolve(checkout).startsWith(`${tempRoot}${path.sep}`);
+				if (
+					(workspaceId && ws.workspace_id === workspaceId) ||
+					(sourceWorkspaceId && ws.workspace_id === sourceWorkspaceId) ||
+					underTemp
+				) {
+					try {
+						await closeWorkspace(ws.workspace_id);
+					} catch {
+						/* ignore */
+					}
+				}
+			}
+		} catch {
+			/* ignore */
+		}
+		fs.rmSync(parent, { recursive: true, force: true });
+	}
+});
+
+test("cleanup keeps a shared source workspace while a linked worktree workspace holds panes", async (t) => {
+	if (!isHerdrAvailable()) return;
+	try {
+		execFileSync("git", ["--version"], { stdio: "ignore" });
+	} catch {
+		return t.skip("git not available");
+	}
+
+	const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-ext-wt-shared-"));
+	const repo = path.join(parent, "repo");
+	fs.mkdirSync(repo);
+	execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
+	fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+	execFileSync("git", ["add", "."], { cwd: repo });
+	execFileSync(
+		"git",
+		["-c", "user.email=test@test", "-c", "user.name=test", "commit", "-qm", "init"],
+		{ cwd: repo },
+	);
+
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext({ mode: "tui" });
+	const spawnTool = api.tools.get("spawn_subagent");
+	const abortTool = api.tools.get("abort_subagent");
+	const subagentsCmd = api.commands.get("subagents");
+
+	let runA: any;
+	let runB: any;
+	let sourceWorkspaceId: string | undefined;
+	let userPaneId: string | undefined;
+	try {
+		// Two worktree runs on the same checkout: the first opens (and owns) the
+		// source-checkout workspace, the second reuses it.
+		const spawnOne = (call: string) =>
+			spawnTool.execute(
+				call,
+				{
+					agent: "scout",
+					task: "Reply with the single word: ready",
+					mode: "pane",
+					layout: "worktree",
+					cwd: repo,
+					wait: false,
+				},
+				undefined,
+				undefined,
+				ctx,
+			);
+		const resA = await spawnOne("call-spawn-wt-shared-a");
+		runA = resA.details.runs[0];
+		assert.strictEqual(resA.isError, undefined, resA.content[0].text);
+		if (runA.worktreeMode !== "herdr") return t.skip("herdr worktree create unavailable");
+		sourceWorkspaceId = runA.ownedSourceWorkspace?.workspaceId;
+		assert.ok(sourceWorkspaceId, "the first run should own the source workspace it opened");
+
+		const resB = await spawnOne("call-spawn-wt-shared-b");
+		runB = resB.details.runs[0];
+		assert.strictEqual(resB.isError, undefined, resB.content[0].text);
+		assert.strictEqual(
+			runB.sourceWorkspaceId,
+			sourceWorkspaceId,
+			"the second run should reuse the same source workspace",
+		);
+		assert.strictEqual(
+			runB.ownedSourceWorkspace,
+			undefined,
+			"only the run that opened the source workspace should own closing it",
+		);
+
+		// The user adds a pane to the second run's worktree workspace.
+		const userPane = await splitPane({ paneId: runB.paneId, direction: "right", cwd: repo, focus: false });
+		userPaneId = userPane.pane_id;
+
+		// Cleanup closes every agent pane; the shared source workspace must then
+		// survive, because closing it would cascade onto the user's pane in the
+		// second run's worktree workspace.
+		await subagentsCmd.handler("cleanup --force", ctx);
+		for (let i = 0; i < 20; i++) {
+			const open = (await listWorkspaces()).map((w: any) => w.workspace_id);
+			if (!open.includes(runA.workspaceId)) break;
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		const open = (await listWorkspaces()).map((w: any) => w.workspace_id);
+		assert.ok(!open.includes(runA.workspaceId), "the first run's empty worktree workspace should be closed");
+		assert.ok(
+			open.includes(runB.workspaceId),
+			"the second run's worktree workspace holds a user pane and must be kept",
+		);
+		assert.ok(
+			open.includes(sourceWorkspaceId),
+			"the shared source workspace must be kept while a linked worktree workspace still has panes",
+		);
+		assert.ok(
+			ctx.notifications.some((n: any) => n.msg.includes("Kept 1 source-checkout workspace(s)")),
+			`expected the kept source workspace in the cleanup message, got: ${JSON.stringify(ctx.notifications)}`,
+		);
+	} finally {
+		if (userPaneId) {
+			try {
+				await closePane(userPaneId);
+			} catch {
+				/* ignore */
+			}
+		}
+		for (const run of [runA, runB]) {
+			if (!run) continue;
+			try {
+				await abortTool.execute(`abort-${run.id}`, { id: run.id, force: true }, undefined, undefined, ctx);
+			} catch {
+				/* ignore */
+			}
+			if (run.worktreePath) {
+				try {
+					await removeGitWorktree(run.worktreePath, { force: true });
+				} catch {
+					/* ignore */
+				}
+			}
+		}
+		// Close anything left pointing into the temp dir (the source and worktree
+		// workspaces) in case the assertions above failed before cleanup could.
+		try {
+			const tempRoot = path.resolve(parent);
+			for (const ws of await listWorkspaces()) {
+				const checkout = ws.worktree?.checkout_path ?? ws.worktree?.path;
+				const underTemp = !!checkout && path.resolve(checkout).startsWith(`${tempRoot}${path.sep}`);
+				if (underTemp) {
+					try {
+						await closeWorkspace(ws.workspace_id);
+					} catch {
+						/* ignore */
+					}
+				}
+			}
+		} catch {
+			/* ignore */
+		}
+		fs.rmSync(parent, { recursive: true, force: true });
+	}
 });

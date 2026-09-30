@@ -6,19 +6,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	addFileIssueComment,
+	applyGhStatus,
 	clearTrackerCache,
 	closeFileIssue,
 	createFileIssue,
 	detectTracker,
 	ensureAuthorPrefix,
+	ensureGhLabels,
 	type CommandRunner,
 	findProjectRoot,
+	ghCreateIssue,
 	ISSUE_TOOL_NAMES,
 	listFileIssues,
 	normalizeStatus,
 	readFileIssue,
 	registerIssueTools,
 	resolveAuthor,
+	wantStatusLabel,
 } from "../issues.ts";
 
 function createMockExtensionAPI() {
@@ -79,6 +83,197 @@ test("detectTracker uses gh for github.com remotes when gh is available", async 
 		command === "gh" ? { code: 1, stdout: "", stderr: "no gh" } : fakeRunner(command, args);
 	const fallback = await detectTracker("/repo", noGh);
 	assert.strictEqual(fallback.kind, "file");
+});
+
+test("ensureGhLabels creates missing labels without clobbering existing ones", async () => {
+	const calls: string[][] = [];
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("list")) {
+			return { code: 0, stdout: JSON.stringify([{ name: "existing" }]), stderr: "" };
+		}
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	const error = await ensureGhLabels("/repo", ["existing", "new-label", "new-label"], fakeRunner);
+	assert.strictEqual(error, null);
+
+	const creates = calls.filter((c) => c.includes("create"));
+	assert.strictEqual(creates.length, 1, "only the missing label should be created");
+	assert.ok(creates[0].includes("new-label"));
+	assert.ok(!creates[0].includes("--force"), "existing labels must not be overwritten");
+});
+
+test("ghCreateIssue retries without an agent-shaped assignee and reports the skip", async () => {
+	const calls: string[][] = [];
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("--assignee")) {
+			return { code: 1, stdout: "", stderr: "could not assign: 'scout' not found" };
+		}
+		return { code: 0, stdout: "https://github.com/org/repo/issues/12\n", stderr: "" };
+	};
+
+	const { result, assigneeSkipped } = await ghCreateIssue(
+		"/repo",
+		{ title: "[scout] recon", body: "body", labels: ["status:in-progress"], assignee: "scout" },
+		fakeRunner,
+	);
+	assert.strictEqual(result.code, 0);
+	assert.strictEqual(assigneeSkipped, "scout");
+	assert.strictEqual(calls.filter((c) => c.includes("create")).length, 2, "expected one retry");
+});
+
+test("applyGhStatus replaces stale status labels instead of accumulating them", async () => {
+	const calls: string[][] = [];
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("view")) {
+			return {
+				code: 0,
+				stdout: JSON.stringify({ state: "OPEN", labels: [{ name: "status:in-progress" }, { name: "bug" }] }),
+				stderr: "",
+			};
+		}
+		if (args.includes("label") && args.includes("list")) {
+			return { code: 0, stdout: JSON.stringify([{ name: "status:blocked" }]), stderr: "" };
+		}
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	const result = await applyGhStatus("/repo", "7", "blocked", fakeRunner);
+	assert.strictEqual(result.error, undefined);
+	assert.strictEqual(result.warning, undefined);
+
+	const edit = calls.find((c) => c.includes("edit"));
+	assert.ok(edit, "expected a gh issue edit call");
+	assert.ok(edit.includes("status:blocked"), "expected the new status label");
+	assert.ok(edit.includes("status:in-progress"), "expected the stale status label to be removed");
+	assert.ok(!calls.some((c) => c.includes("close")), "blocked must not close the issue");
+});
+
+test("applyGhStatus closes on done (removing stale labels first) and reopens on reactivation", async () => {
+	const calls: string[][] = [];
+	let state = "OPEN";
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("view")) {
+			return { code: 0, stdout: JSON.stringify({ state, labels: [{ name: "status:blocked" }] }), stderr: "" };
+		}
+		if (args.includes("close")) state = "CLOSED";
+		if (args.includes("reopen")) state = "OPEN";
+		if (args.includes("label") && args.includes("list")) {
+			return { code: 0, stdout: JSON.stringify([{ name: "status:in-progress" }]), stderr: "" };
+		}
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	assert.deepStrictEqual(await applyGhStatus("/repo", "7", "done", fakeRunner), {});
+	const editIdx = calls.findIndex((c) => c.includes("edit"));
+	const closeIdx = calls.findIndex((c) => c.includes("close"));
+	assert.ok(editIdx >= 0 && closeIdx > editIdx, "stale label removal must precede close");
+	assert.ok(calls[editIdx].includes("status:blocked"));
+
+	// Moving a closed issue back to an active state reopens it.
+	calls.length = 0;
+	assert.deepStrictEqual(await applyGhStatus("/repo", "7", "in-progress", fakeRunner), {});
+	assert.ok(calls.some((c) => c.includes("reopen")), "expected gh issue reopen");
+});
+
+test("applyGhStatus open removes stale labels, reopens, and does not add a status:open label", async () => {
+	const calls: string[][] = [];
+	let state = "CLOSED";
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("view")) {
+			return {
+				code: 0,
+				stdout: JSON.stringify({ state, labels: [{ name: "status:done" }, { name: "status:blocked" }] }),
+				stderr: "",
+			};
+		}
+		if (args.includes("reopen")) state = "OPEN";
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	assert.deepStrictEqual(await applyGhStatus("/repo", "7", "open", fakeRunner), {});
+	assert.ok(calls.some((c) => c.includes("reopen")), "expected gh issue reopen");
+
+	const edit = calls.find((c) => c.includes("edit"));
+	assert.ok(edit, "expected a gh issue edit call");
+	assert.ok(!edit.includes("--add-label"), "open must not add a status label");
+	assert.ok(edit.includes("status:done") && edit.includes("status:blocked"), "all stale status labels must be removed");
+});
+
+test("applyGhStatus done clears every status label and is idempotent on a closed issue", async () => {
+	const calls: string[][] = [];
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("view")) {
+			return {
+				code: 0,
+				stdout: JSON.stringify({ state: "CLOSED", labels: [{ name: "status:done" }, { name: "status:blocked" }] }),
+				stderr: "",
+			};
+		}
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	assert.deepStrictEqual(await applyGhStatus("/repo", "7", "done", fakeRunner), {});
+	const edit = calls.find((c) => c.includes("edit"));
+	assert.ok(edit, "expected a gh issue edit call");
+	assert.ok(edit.includes("status:done") && edit.includes("status:blocked"), "every status label must be removed");
+	assert.ok(!calls.some((c) => c.includes("close")), "already closed issues must not be closed again");
+});
+
+test("applyGhStatus warns (instead of failing) when the status label cannot be created", async () => {
+	const calls: string[][] = [];
+	const fakeRunner: CommandRunner = async (command, args) => {
+		calls.push([command, ...args]);
+		if (args.includes("view")) {
+			return { code: 0, stdout: JSON.stringify({ state: "OPEN", labels: [{ name: "status:blocked" }] }), stderr: "" };
+		}
+		if (args.includes("label") && args.includes("list")) {
+			return { code: 0, stdout: "[]", stderr: "" };
+		}
+		if (args.includes("label") && args.includes("create")) {
+			return { code: 1, stdout: "", stderr: "permission denied" };
+		}
+		return { code: 0, stdout: "", stderr: "" };
+	};
+
+	const result = await applyGhStatus("/repo", "7", "in-progress", fakeRunner);
+	assert.strictEqual(result.error, undefined, "a label permission problem must not fail the transition");
+	assert.match(result.warning ?? "", /status:in-progress/);
+	assert.ok(
+		!calls.some((c) => c.includes("edit") && c.includes("--add-label")),
+		"the uncreatable label must not be attempted on edit",
+	);
+	const edit = calls.find((c) => c.includes("edit"));
+	assert.ok(edit && edit.includes("status:blocked"), "stale labels must still be removed");
+});
+
+test("ghCreateIssue reports the first error when the no-assignee retry also fails", async () => {
+	const fakeRunner: CommandRunner = async (command, args) =>
+		args.includes("--assignee")
+			? { code: 1, stdout: "", stderr: "could not assign: broken" }
+			: { code: 1, stdout: "", stderr: "network down" };
+
+	const { result, assigneeError, retriedWithoutAssignee } = await ghCreateIssue(
+		"/repo",
+		{ title: "t", body: "b", labels: [], assignee: "scout" },
+		fakeRunner,
+	);
+	assert.strictEqual(result.code, 1);
+	assert.strictEqual(assigneeError, "could not assign: broken", "the first attempt error must be preserved");
+	assert.strictEqual(retriedWithoutAssignee, true);
+});
+
+test("wantStatusLabel marks only the active in-between states", () => {
+	assert.strictEqual(wantStatusLabel("open"), false);
+	assert.strictEqual(wantStatusLabel("done"), false);
+	assert.strictEqual(wantStatusLabel("in-progress"), true);
+	assert.strictEqual(wantStatusLabel("blocked"), true);
 });
 
 test("file board create/list/get/comment/close lifecycle", () => {

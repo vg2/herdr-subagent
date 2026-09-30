@@ -15,6 +15,18 @@ export type RunStatus = "running" | "done" | "failed" | "aborted" | "blocked";
 export type SpawnMode = "pane" | "headless";
 export type LayoutChoice = "auto" | "pane" | "tab" | "worktree";
 
+/**
+ * A source-checkout Herdr workspace a worktree run opened for itself. Herdr
+ * links the worktree workspace to it, so closing it also closes the worktree
+ * workspace; cleanup only does so when no other run still needs it and the user
+ * has not added panes to it.
+ */
+export interface SourceWorkspace {
+	workspaceId: string;
+	/** Panes present when this extension opened it; only these are ours to close. */
+	paneIds: string[];
+}
+
 export interface UsageStats {
 	input: number;
 	output: number;
@@ -69,7 +81,14 @@ export interface SubagentRun {
 	worktreePath?: string;
 	worktreeBranch?: string;
 	worktreeRepoRoot?: string;
+	worktreeMode?: "herdr" | "git";
 	workspaceId?: string;
+	/** Root shell pane from `herdr worktree create`, kept only if it could not be closed. */
+	worktreeShellPaneId?: string;
+	/** Source-checkout workspace herdr linked the worktree workspace to. */
+	sourceWorkspaceId?: string;
+	/** Set only when this run opened the source workspace itself (cleanup closes it). */
+	ownedSourceWorkspace?: SourceWorkspace;
 }
 
 /** Plain, serializable snapshot used in tool `details`, session entries, and status output. */
@@ -109,7 +128,11 @@ export interface RunView {
 	worktreePath?: string;
 	worktreeBranch?: string;
 	worktreeRepoRoot?: string;
+	worktreeMode?: "herdr" | "git";
 	workspaceId?: string;
+	worktreeShellPaneId?: string;
+	sourceWorkspaceId?: string;
+	ownedSourceWorkspace?: SourceWorkspace;
 }
 
 export const REPORT_CAP_BYTES = 50 * 1024;
@@ -183,7 +206,11 @@ export function toView(run: SubagentRun, options: { includeReport?: boolean } = 
 		worktreePath: run.worktreePath,
 		worktreeBranch: run.worktreeBranch,
 		worktreeRepoRoot: run.worktreeRepoRoot,
+		worktreeMode: run.worktreeMode,
 		workspaceId: run.workspaceId,
+		worktreeShellPaneId: run.worktreeShellPaneId,
+		sourceWorkspaceId: run.sourceWorkspaceId,
+		ownedSourceWorkspace: run.ownedSourceWorkspace,
 	};
 
 	if (options.includeReport && run.status !== "running") {

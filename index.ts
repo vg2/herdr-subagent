@@ -40,6 +40,7 @@ import { collectRuns, harvestReport } from "./collect.ts";
 import {
 	closePane,
 	closeTab,
+	closeWorkspace,
 	focusAgent,
 	focusTab,
 	getAgent,
@@ -61,7 +62,12 @@ import {
 	startHeadless,
 	startPane,
 } from "./spawner.ts";
-import { prepareWorktree, removeGitWorktree, type PreparedWorktree } from "./worktree.ts";
+import {
+	forgetSourceWorkspace,
+	prepareWorktree,
+	removeGitWorktree,
+	type PreparedWorktree,
+} from "./worktree.ts";
 import {
 	emptyUsage,
 	isSettled,
@@ -734,7 +740,10 @@ export default function (pi: ExtensionAPI) {
 				worktreePath: worktree?.path,
 				worktreeBranch: worktree?.branch,
 				worktreeRepoRoot: worktree?.repoRoot,
+				worktreeMode: worktree?.mode,
 				workspaceId: worktree?.workspaceId,
+				sourceWorkspaceId: worktree?.sourceWorkspaceId,
+				ownedSourceWorkspace: worktree?.ownedSourceWorkspace,
 				abort: () => {
 					/* replaced by spawner */
 				},
@@ -1556,6 +1565,19 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
+				// Close leftover worktree shell panes (the root panes `herdr worktree
+				// create` made). They are idle shells this extension created; only
+				// tracked when they could not be closed at spawn time.
+				for (const r of registry.list()) {
+					if (!r.worktreeShellPaneId) continue;
+					try {
+						await closePane(r.worktreeShellPaneId);
+						r.worktreeShellPaneId = undefined;
+					} catch (err) {
+						if (isNotFoundError(err)) r.worktreeShellPaneId = undefined;
+					}
+				}
+
 				// Check if dedicated "subagents" tab is now empty and can be closed
 				if (isHerdrAvailable()) {
 					try {
@@ -1574,10 +1596,12 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
-				// Worktree checkouts are only removed on explicit opt-in: deleting them
-				// could discard a child's uncommitted work.
+				// Worktree checkouts are only removed on explicit opt-in. `git worktree
+				// remove` refuses when the checkout has uncommitted work; that is surfaced
+				// as a skip so nothing is discarded without `--force`.
 				let removedWorktrees = 0;
 				let skippedWorktrees = 0;
+				let dirtyWorktrees = 0;
 				if (cleanupWorktrees) {
 					for (const r of registry.list()) {
 						if (!r.worktreePath) continue;
@@ -1585,7 +1609,7 @@ export default function (pi: ExtensionAPI) {
 							skippedWorktrees++;
 							continue;
 						}
-						if (r.mode === "pane" && !r.paneClosed) {
+						if (r.worktreeShellPaneId || (r.mode === "pane" && !r.paneClosed)) {
 							// The checkout is still in use by an open pane.
 							skippedWorktrees++;
 							continue;
@@ -1594,10 +1618,99 @@ export default function (pi: ExtensionAPI) {
 							continue;
 						}
 						try {
-							await removeGitWorktree(r.worktreePath);
+							await removeGitWorktree(r.worktreePath, { force });
 							removedWorktrees++;
-						} catch {
+						} catch (err: any) {
 							skippedWorktrees++;
+							const detail = String(err?.message ?? err);
+							if (!force && /modified or untracked|uncommitted/i.test(detail)) dirtyWorktrees++;
+						}
+					}
+				}
+
+				// Close the herdr workspaces this extension created for worktree
+				// isolation once none of its panes remain. A workspace the user added
+				// panes to is left alone (never close what we don't own).
+				let closedWorkspaces = 0;
+				let skippedWorkspaces = 0;
+				let closedSourceWorkspaces = 0;
+				let keptSourceWorkspaces = 0;
+				if (isHerdrAvailable()) {
+					const runs = registry.list();
+					// A source-checkout workspace opened for a worktree is linked to that
+					// worktree's workspace (closing it closes the worktree too) and can be
+					// shared by every run that reused it. Keep it while any run still has
+					// an open pane — or, once its own agent pane is gone, while its worktree
+					// workspace still shows panes (e.g. the user added some): closing the
+					// source would cascade onto them.
+					const sourceInUse = new Set<string>();
+					for (const r of runs) {
+						if (!r.sourceWorkspaceId) continue;
+						if (!!r.worktreeShellPaneId || (r.mode === "pane" && !r.paneClosed)) {
+							sourceInUse.add(r.sourceWorkspaceId);
+							continue;
+						}
+						if (r.worktreeMode !== "herdr" || !r.workspaceId) continue;
+						try {
+							const panes = await listPanes(r.workspaceId);
+							if (panes.length > 0) sourceInUse.add(r.sourceWorkspaceId);
+						} catch (err) {
+								// Already gone: nothing to protect. Unknown state: keep it and retry later.
+								if (!isNotFoundError(err)) sourceInUse.add(r.sourceWorkspaceId);
+						}
+					}
+					for (const r of runs) {
+						if (r.worktreeMode !== "herdr" || !r.workspaceId) continue;
+						let worktreeWorkspaceGone = false;
+						if (r.worktreeShellPaneId || (r.mode === "pane" && !r.paneClosed)) {
+							skippedWorkspaces++;
+						} else {
+							try {
+								const panes = await listPanes(r.workspaceId);
+								if (panes.length > 0) {
+									skippedWorkspaces++;
+								} else {
+									await closeWorkspace(r.workspaceId);
+									closedWorkspaces++;
+									worktreeWorkspaceGone = true;
+								}
+							} catch (err) {
+								// Already closed by herdr (e.g. auto-closed with the last pane).
+								if (isNotFoundError(err)) {
+									closedWorkspaces++;
+									worktreeWorkspaceGone = true;
+								} else {
+									skippedWorkspaces++;
+								}
+							}
+						}
+
+						// Close the source workspace this run opened itself, once its worktree
+						// workspace is gone, no other run needs it, and the user has not added
+						// panes to it. Closing it also closes the linked worktree workspace.
+						const owned = r.ownedSourceWorkspace;
+						if (!owned || !worktreeWorkspaceGone) continue;
+						if (sourceInUse.has(owned.workspaceId)) {
+							keptSourceWorkspaces++;
+							continue;
+						}
+						try {
+							const panes = await listPanes(owned.workspaceId);
+							const mine = new Set(owned.paneIds);
+							if (panes.some((p) => !mine.has(p.pane_id))) {
+								keptSourceWorkspaces++;
+								continue;
+							}
+							await closeWorkspace(owned.workspaceId);
+							closedSourceWorkspaces++;
+							forgetSourceWorkspace(owned.workspaceId);
+						} catch (err) {
+							if (isNotFoundError(err)) {
+								closedSourceWorkspaces++;
+								forgetSourceWorkspace(owned.workspaceId);
+							} else {
+								keptSourceWorkspaces++;
+							}
 						}
 					}
 				}
@@ -1608,10 +1721,26 @@ export default function (pi: ExtensionAPI) {
 				if (skippedCount > 0) {
 					msg += ` Skipped ${skippedCount} active pane(s) (use --force to close).`;
 				}
+				if (closedWorkspaces > 0) {
+					msg += ` Closed ${closedWorkspaces} worktree workspace(s).`;
+				}
+				if (skippedWorkspaces > 0) {
+					msg += ` Kept ${skippedWorkspaces} worktree workspace(s) still in use.`;
+				}
+				if (closedSourceWorkspaces > 0) {
+					msg += ` Closed ${closedSourceWorkspaces} source-checkout workspace(s).`;
+				}
+				if (keptSourceWorkspaces > 0) {
+					msg += ` Kept ${keptSourceWorkspaces} source-checkout workspace(s) still in use.`;
+				}
 				if (cleanupWorktrees) {
 					msg += ` Removed ${removedWorktrees} worktree(s).`;
-					if (skippedWorktrees > 0) {
-						msg += ` Skipped ${skippedWorktrees} worktree(s) (active or still in use).`;
+					const otherSkipped = skippedWorktrees - dirtyWorktrees;
+					if (otherSkipped > 0) {
+						msg += ` Skipped ${otherSkipped} worktree(s) (active or still in use).`;
+					}
+					if (dirtyWorktrees > 0) {
+						msg += ` Skipped ${dirtyWorktrees} worktree(s) with uncommitted changes (rerun with --force to discard).`;
 					}
 				}
 				ctx.ui.notify(msg, "info");
