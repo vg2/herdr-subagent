@@ -425,15 +425,18 @@ reconstructed on `session_start` from the branch (`ctx.sessionManager.getBranch(
    report file; session JSONL fallback.
 8. Abort/notification handling; `/subagents` command.
 
-**Phase 3 — coordination & polish**
+**Phase 3 — coordination & polish** *(implemented)*
 9. Issue channel (gh + file board), shared tools for parent & children.
+   *(Done: `issues.ts` registers `issue_create/comment/list/get/close`; children load it via `-e issues.ts` with issue tools appended to persona allowlists; the board always resolves to the main checkout via `git rev-parse --git-common-dir`, so worktree children share it.)*
 10. Status widget / footer, `subagent_message` steering.
+    *(Done: `ctx.ui.setStatus("herdr-subagent", …)` line plus the `subagent_message` tool for pane children; headless children are rejected with a clear message.)*
 11. Chain/parallel sugar (optional; the parent can do it with multiple
     spawns), write-parallel worktree layout.
+    *(Worktree layout done (`layout: "worktree"`, herdr workspace when available, plain `git worktree add` fallback). Chain/parallel sugar intentionally skipped: multiple `spawn_subagent` calls already run in parallel and `wait: true` covers sequential flows.)*
 12. Selective-delegation guidance: finalize tool descriptions + a
     guidelines section injected via `before_agent_start` so the model
     delegates by policy, not eagerness (includes the model-selection
-    guidance).
+    guidance). *(Done: tool descriptions updated and `DELEGATION_GUIDELINES` appended to `systemPromptOptions.promptGuidelines` when `spawn_subagent` is active.)*
 
 **Phase 4 — hardening**
 - Blocked-child UX (surface `blocked` state, let the user answer the child

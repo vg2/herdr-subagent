@@ -13,7 +13,7 @@ import type { AgentSource } from "./agents.ts";
 
 export type RunStatus = "running" | "done" | "failed" | "aborted" | "blocked";
 export type SpawnMode = "pane" | "headless";
-export type LayoutChoice = "auto" | "pane" | "tab";
+export type LayoutChoice = "auto" | "pane" | "tab" | "worktree";
 
 export interface UsageStats {
 	input: number;
@@ -64,6 +64,12 @@ export interface SubagentRun {
 	sessionId?: string;
 	notified?: boolean;
 	paneClosed?: boolean;
+
+	// Phase 3 worktree isolation
+	worktreePath?: string;
+	worktreeBranch?: string;
+	worktreeRepoRoot?: string;
+	workspaceId?: string;
 }
 
 /** Plain, serializable snapshot used in tool `details`, session entries, and status output. */
@@ -98,6 +104,12 @@ export interface RunView {
 	agentName?: string;
 	sessionId?: string;
 	paneClosed?: boolean;
+
+	// Phase 3 worktree isolation
+	worktreePath?: string;
+	worktreeBranch?: string;
+	worktreeRepoRoot?: string;
+	workspaceId?: string;
 }
 
 export const REPORT_CAP_BYTES = 50 * 1024;
@@ -168,6 +180,10 @@ export function toView(run: SubagentRun, options: { includeReport?: boolean } = 
 		agentName: run.agentName,
 		sessionId: run.sessionId,
 		paneClosed: run.paneClosed,
+		worktreePath: run.worktreePath,
+		worktreeBranch: run.worktreeBranch,
+		worktreeRepoRoot: run.worktreeRepoRoot,
+		workspaceId: run.workspaceId,
 	};
 
 	if (options.includeReport && run.status !== "running") {

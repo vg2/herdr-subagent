@@ -34,6 +34,8 @@ export interface PaneInfo {
 	tab_id: string;
 	workspace_id: string;
 	cwd: string;
+	/** Current foreground-process cwd, when reported by herdr. */
+	foreground_cwd?: string;
 	focused: boolean;
 	agent_status?: string;
 	terminal_id?: string;
@@ -436,10 +438,87 @@ export async function showNotification(
 }
 
 // ---------------------------------------------------------------------------
+// Worktree operations (write-parallel isolation, Plan 3.5)
+// ---------------------------------------------------------------------------
+
+export interface WorktreeInfo {
+	branch: string;
+	path: string;
+	label?: string;
+	is_linked_worktree?: boolean;
+	is_prunable?: boolean;
+	open_workspace_id?: string;
+	repo_root?: string;
+}
+
+export interface WorkspaceInfo {
+	workspace_id: string;
+	label: string;
+	focused: boolean;
+	pane_count: number;
+	tab_count: number;
+	worktree?: WorktreeInfo & { checkout_path?: string; repo_name?: string };
+}
+
+export interface CreateWorktreeOptions {
+	/** Repository checkout used as the worktree source (@deprecated in favor of workspaceId). */
+	cwd?: string;
+	branch?: string;
+	base?: string;
+	path?: string;
+	label?: string;
+	focus?: boolean;
+	/** Existing workspace of the source repo; mutually exclusive with cwd. */
+	workspaceId?: string;
+}
+
+export interface CreatedWorktree {
+	workspace: WorkspaceInfo;
+	tab: TabInfo;
+	rootPane: PaneInfo;
+	worktree: WorktreeInfo;
+}
+
+/** Create and open a git worktree-backed Herdr workspace. */
+export async function createWorktree(options: CreateWorktreeOptions): Promise<CreatedWorktree> {
+	const args = ["worktree", "create"];
+	// --workspace and --cwd are mutually exclusive. Prefer the workspace form when
+	// the source repo is already open, so herdr does not open a second workspace
+	// for the source checkout.
+	if (options.workspaceId) {
+		args.push("--workspace", options.workspaceId);
+	} else if (options.cwd) {
+		args.push("--cwd", options.cwd);
+	}
+	if (options.branch) args.push("--branch", options.branch);
+	if (options.base) args.push("--base", options.base);
+	if (options.path) args.push("--path", options.path);
+	if (options.label) args.push("--label", options.label);
+	args.push(options.focus ? "--focus" : "--no-focus");
+
+	const res = await herdrExec<{
+		workspace: WorkspaceInfo;
+		tab: TabInfo;
+		root_pane: PaneInfo;
+		worktree: WorktreeInfo;
+	}>(args);
+
+	if (!res.root_pane || !res.tab || !res.worktree) {
+		throw new Error("herdr worktree create did not return a pane, tab, and worktree");
+	}
+	return {
+		workspace: res.workspace,
+		tab: res.tab,
+		rootPane: res.root_pane,
+		worktree: res.worktree,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Layout Policy
 // ---------------------------------------------------------------------------
 
-export type LayoutPolicy = "auto" | "pane" | "tab";
+export type LayoutPolicy = "auto" | "pane" | "tab" | "worktree";
 
 export interface ResolvedPaneTarget {
 	paneId: string;
@@ -479,11 +558,15 @@ export async function resolveLayoutTarget(options: {
 	cwd: string;
 	activePaneSubagentsCount: number;
 	workspaceId?: string;
+	/** Extra child env vars, merged over CLEAN_CHILD_ENV. */
+	env?: Record<string, string>;
 }): Promise<ResolvedPaneTarget> {
 	const { layout, cwd, activePaneSubagentsCount } = options;
 	const workspaceId = options.workspaceId ?? process.env.HERDR_WORKSPACE_ID;
+	const env = { ...CLEAN_CHILD_ENV, ...(options.env ?? {}) };
 
-	const useTab = layout === "tab" || (layout === "auto" && activePaneSubagentsCount >= 2);
+	const useTab =
+		layout === "tab" || ((layout === "auto" || layout === "worktree") && activePaneSubagentsCount >= 2);
 
 	if (useTab) {
 		const tabs = await listTabs(workspaceId);
@@ -500,7 +583,7 @@ export async function resolveLayoutTarget(options: {
 					paneId: targetPane.pane_id,
 					direction,
 					cwd,
-					env: CLEAN_CHILD_ENV,
+					env,
 					focus: false,
 				});
 				return { paneId: pane.pane_id, tabId: existingSubagentsTab.tab_id, layoutMode: "tab" };
@@ -511,7 +594,7 @@ export async function resolveLayoutTarget(options: {
 		const created = await createTab({
 			label: "subagents",
 			cwd,
-			env: CLEAN_CHILD_ENV,
+			env,
 			focus: false,
 			workspaceId,
 		});
@@ -528,7 +611,7 @@ export async function resolveLayoutTarget(options: {
 		current: true,
 		direction,
 		cwd,
-		env: CLEAN_CHILD_ENV,
+		env,
 		focus: false,
 	});
 	return { paneId: pane.pane_id, tabId: pane.tab_id, layoutMode: "pane" };

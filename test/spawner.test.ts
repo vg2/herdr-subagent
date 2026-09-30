@@ -2,12 +2,16 @@ import test from "node:test";
 import assert from "node:assert";
 import * as path from "node:path";
 import {
+	childEnv,
+	childIdentityEnv,
+	childToolAllowlist,
 	resolveSpawnMode,
 	resolveModel,
 	buildDelegationPrompt,
 	createRunDir,
 	startPane,
 } from "../spawner.ts";
+import { ISSUE_TOOL_NAMES } from "../issues.ts";
 import { isHerdrAvailable, getAgent, listAgents } from "../herdr.ts";
 import { emptyUsage, type SubagentRun, RunRegistry } from "../state.ts";
 import type { AgentConfig } from "../agents.ts";
@@ -292,5 +296,55 @@ test("startPane creates pane child and abort cleans it up", async () => {
 				/* ignore */
 			}
 		}
+	}
+});
+
+test("childToolAllowlist appends the shared issue tools to persona allowlists", () => {
+	const persona: AgentConfig = {
+		name: "scout",
+		description: "test",
+		tools: ["read", "grep"],
+		systemPrompt: "",
+		source: "user",
+		filePath: "(test)",
+	};
+
+	const tools = childToolAllowlist(persona);
+	assert.ok(tools);
+	assert.ok(tools.includes("read"));
+	assert.ok(tools.includes("grep"));
+	for (const name of ISSUE_TOOL_NAMES) {
+		assert.ok(tools.includes(name), `expected issue tool ${name}`);
+	}
+
+	// Personas without an allowlist keep full tool access (issue tools included).
+	assert.strictEqual(childToolAllowlist({ ...persona, tools: undefined }), undefined);
+});
+
+test("childEnv strips HERDR_* and adds the child identity vars", () => {
+	const previousPane = process.env.HERDR_PANE_ID;
+	const previousAgent = process.env.PI_SUBAGENT_AGENT;
+	process.env.HERDR_PANE_ID = "wF:p1";
+
+	try {
+		const run = { id: "sa-scout-1" } as SubagentRun;
+		const persona: AgentConfig = {
+			name: "scout",
+			description: "test",
+			systemPrompt: "",
+			source: "user",
+			filePath: "(test)",
+		};
+
+		const env = childEnv(childIdentityEnv(run, persona));
+		assert.strictEqual(env.HERDR_ENV, "0");
+		assert.strictEqual(env.HERDR_PANE_ID, undefined);
+		assert.strictEqual(env.PI_SUBAGENT_AGENT, "scout");
+		assert.strictEqual(env.PI_SUBAGENT_ID, "sa-scout-1");
+	} finally {
+		if (previousPane === undefined) delete process.env.HERDR_PANE_ID;
+		else process.env.HERDR_PANE_ID = previousPane;
+		if (previousAgent === undefined) delete process.env.PI_SUBAGENT_AGENT;
+		else process.env.PI_SUBAGENT_AGENT = previousAgent;
 	}
 });

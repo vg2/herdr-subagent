@@ -32,15 +32,19 @@ import {
 	sendKeys,
 	startAgent,
 } from "./herdr.ts";
+import { ISSUE_TOOL_NAMES } from "./issues.ts";
 import type { LayoutChoice, SpawnMode, SubagentRun } from "./state.ts";
+import type { PreparedWorktree } from "./worktree.ts";
 
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const GUARD_PATH = path.join(EXTENSION_DIR, "guard.ts");
+export const ISSUES_PATH = path.join(EXTENSION_DIR, "issues.ts");
 
 export const CROSS_AGENT_POLICY =
 	"You cannot contact other agents directly, and you must not attempt to control herdr " +
 	"(the terminal multiplexer) or other agent sessions. Shared findings, blockers, and " +
-	"hand-offs go through the project issue tracker, which is the sanctioned channel.";
+	"hand-offs go through the project issue tracker, which is the sanctioned channel: use the " +
+	"issue_create / issue_comment / issue_list / issue_get / issue_close tools.";
 
 export interface HeadlessSpawnOptions {
 	run: SubagentRun;
@@ -261,15 +265,29 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 /**
  * Environment hygiene: no herdr discovery for children, and no inherited
  * `HERDR_*` identifiers that could be used to address the parent's panes.
+ * `extra` adds child identity vars used by the issue tools.
  */
-export function childEnv(): NodeJS.ProcessEnv {
+export function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) {
 		if (key.startsWith("HERDR_")) continue;
 		env[key] = value;
 	}
 	env.HERDR_ENV = "0";
-	return env;
+	return { ...env, ...extra };
+}
+
+/** Child identity vars for the issue board (author attribution). */
+export function childIdentityEnv(run: SubagentRun, persona: AgentConfig): Record<string, string> {
+	return { PI_SUBAGENT_AGENT: persona.name, PI_SUBAGENT_ID: run.id };
+}
+
+/** Persona tool allowlist plus the shared issue tools (the sanctioned channel). */
+export function childToolAllowlist(persona: AgentConfig): string[] | undefined {
+	if (!persona.tools || persona.tools.length === 0) return undefined;
+	const tools = new Set(persona.tools);
+	for (const tool of ISSUE_TOOL_NAMES) tools.add(tool);
+	return Array.from(tools);
 }
 
 export function buildDelegationPrompt(options: {
@@ -306,6 +324,9 @@ export function buildDelegationPrompt(options: {
 		"",
 		"## Cross-agent policy",
 		CROSS_AGENT_POLICY,
+		"If you record work on the issue board, keep its contract: the title is prefixed with your agent name, " +
+			"the body states the task, findings, and artifact paths, and you move the status open -> in-progress -> " +
+			"blocked -> done and close the issue when the work is complete.",
 	].join("\n");
 }
 
@@ -366,11 +387,14 @@ export function startHeadless(options: HeadlessSpawnOptions): Promise<void> {
 		"--no-skills",
 		"-e",
 		GUARD_PATH,
+		"-e",
+		ISSUES_PATH,
 	];
 
 	if (run.model) args.push("--model", run.model);
 	if (run.thinking) args.push("--thinking", run.thinking);
-	if (persona.tools && persona.tools.length > 0) args.push("--tools", persona.tools.join(","));
+	const tools = childToolAllowlist(persona);
+	if (tools) args.push("--tools", tools.join(","));
 
 	let personaPath: string | null = null;
 	if (persona.systemPrompt.trim()) {
@@ -386,6 +410,11 @@ export function startHeadless(options: HeadlessSpawnOptions): Promise<void> {
 	let wasAborted = false;
 	run.abort = () => {
 		wasAborted = true;
+		// Reflect the abort immediately so callers/status widgets are accurate
+		// before the process actually exits.
+		run.status = "aborted";
+		run.stopReason = run.stopReason ?? "aborted";
+		run.endedAt = Date.now();
 		controller.abort();
 	};
 
@@ -400,7 +429,7 @@ export function startHeadless(options: HeadlessSpawnOptions): Promise<void> {
 			cwd: run.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: childEnv(),
+			env: childEnv(childIdentityEnv(run, persona)),
 		});
 
 		let buffer = "";
@@ -563,6 +592,8 @@ export interface PaneSpawnOptions {
 	layout: LayoutChoice;
 	signal?: AbortSignal;
 	activePaneCount: number;
+	/** Pre-created worktree (layout "worktree"); its pane/workspace is reused when set. */
+	worktree?: PreparedWorktree;
 }
 
 /**
@@ -570,22 +601,40 @@ export interface PaneSpawnOptions {
  * Returns once the child process is started and the initial prompt has reached `working`.
  */
 export async function startPane(options: PaneSpawnOptions): Promise<void> {
-	const { run, persona, delegationPrompt, layout, signal, activePaneCount } = options;
+	const { run, persona, delegationPrompt, layout, signal, activePaneCount, worktree } = options;
 
 	run.mode = "pane";
 	run.layout = layout;
 	run.sessionId = crypto.randomUUID();
-
-	const target = await resolveLayoutTarget({
-		layout,
-		cwd: run.cwd,
-		activePaneSubagentsCount: activePaneCount,
-	});
-
-	run.paneId = target.paneId;
-	run.tabId = target.tabId;
 	run.agentName = run.id;
 	run.paneClosed = false;
+
+	if (worktree) {
+		run.worktreePath = worktree.path;
+		run.worktreeBranch = worktree.branch;
+		run.worktreeRepoRoot = worktree.repoRoot;
+		run.workspaceId = worktree.workspaceId;
+	}
+
+	if (worktree?.paneId) {
+		// Herdr already opened a worktree workspace with a root pane.
+		run.paneId = worktree.paneId;
+		run.tabId = worktree.tabId;
+	} else {
+		const target = await resolveLayoutTarget({
+			layout: worktree ? "auto" : layout,
+			cwd: run.cwd,
+			activePaneSubagentsCount: activePaneCount,
+			env: childIdentityEnv(run, persona),
+			workspaceId: worktree?.workspaceId,
+		});
+		run.paneId = target.paneId;
+		run.tabId = target.tabId;
+		if (worktree && !run.workspaceId) {
+			// Plain-git fallback: the pane lives in the current workspace.
+			run.workspaceId = process.env.HERDR_WORKSPACE_ID;
+		}
+	}
 
 	const args: string[] = [
 		"--session-id",
@@ -596,11 +645,14 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 		"--no-skills",
 		"-e",
 		GUARD_PATH,
+		"-e",
+		ISSUES_PATH,
 	];
 
 	if (run.model) args.push("--model", run.model);
 	if (run.thinking) args.push("--thinking", run.thinking);
-	if (persona.tools && persona.tools.length > 0) args.push("--tools", persona.tools.join(","));
+	const tools = childToolAllowlist(persona);
+	if (tools) args.push("--tools", tools.join(","));
 
 	let personaPath: string | null = null;
 	if (persona.systemPrompt.trim()) {

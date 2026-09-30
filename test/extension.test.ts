@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import extensionFactory from "../index.ts";
 import { closePane, isHerdrAvailable } from "../herdr.ts";
 
@@ -72,6 +75,133 @@ test("extension registers all Phase 2 tools and commands", () => {
 
 	// Registered command
 	assert.ok(api.commands.has("subagents"));
+});
+
+test("extension registers the Phase 3 coordination tools", () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+
+	assert.ok(api.tools.has("subagent_message"));
+	for (const name of ["issue_create", "issue_comment", "issue_list", "issue_get", "issue_close"]) {
+		assert.ok(api.tools.has(name), `missing ${name}`);
+	}
+});
+
+test("before_agent_start injects delegation guidelines only when spawn_subagent is active", () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+
+	const handler = (api.handlers.get("before_agent_start") ?? [])[0];
+	assert.ok(handler, "before_agent_start handler should be registered");
+
+	const active: any = { selectedTools: ["spawn_subagent"], promptGuidelines: [] };
+	handler({ systemPromptOptions: active }, createMockContext());
+	assert.ok(active.promptGuidelines.length >= 5, "expected delegation guidelines");
+	assert.ok(active.promptGuidelines.some((g: string) => g.includes("Delegate selectively")));
+	assert.ok(active.promptGuidelines.some((g: string) => g.includes("worktree")));
+
+	const inactive: any = { selectedTools: ["read"], promptGuidelines: [] };
+	handler({ systemPromptOptions: inactive }, createMockContext());
+	assert.strictEqual(inactive.promptGuidelines.length, 0);
+}, 1);
+
+test("session_start installs the sub-agent status widget and updates it on spawn/abort", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+
+	const statuses: Array<[string, string | undefined]> = [];
+	const ctx = createMockContext({
+		ui: {
+			notify: () => {},
+			confirm: async () => true,
+			setStatus: (key: string, value: string | undefined) => statuses.push([key, value]),
+		},
+	});
+
+	for (const handler of api.handlers.get("session_start") ?? []) {
+		await handler({}, ctx);
+	}
+	assert.ok(statuses.some(([key]) => key === "herdr-subagent"), "session_start should clear/initialize the widget");
+
+	const spawnTool = api.tools.get("spawn_subagent");
+	const spawnResult = await spawnTool.execute(
+		"call-widget-spawn",
+		{ agent: "scout", task: "Say hello", mode: "headless", wait: false },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const run = spawnResult.details.runs[0];
+
+	const running = statuses[statuses.length - 1];
+	assert.strictEqual(running[0], "herdr-subagent");
+	assert.ok(running[1]?.includes("scout"), `expected scout in widget text, got ${running[1]}`);
+
+	const abortTool = api.tools.get("abort_subagent");
+	await abortTool.execute("call-widget-abort", { id: run.id, force: true }, undefined, undefined, ctx);
+	assert.strictEqual(statuses[statuses.length - 1][1], undefined, "widget clears when nothing is active");
+});
+
+test("subagent_message rejects unknown and headless children", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext();
+
+	const messageTool = api.tools.get("subagent_message");
+	const unknown = await messageTool.execute(
+		"call-msg-unknown",
+		{ id: "sa-nope-1", message: "hi" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.strictEqual(unknown.isError, true);
+
+	const spawnTool = api.tools.get("spawn_subagent");
+	const spawnResult = await spawnTool.execute(
+		"call-spawn-msg",
+		{ agent: "scout", task: "Say hello", mode: "headless", wait: false },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const run = spawnResult.details.runs[0];
+	try {
+		const res = await messageTool.execute(
+			"call-msg-headless",
+			{ id: run.id, message: "extra context" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.strictEqual(res.isError, true);
+		assert.ok(res.content[0].text.includes("headless"));
+	} finally {
+		const abortTool = api.tools.get("abort_subagent");
+		await abortTool.execute("call-abort-msg", { id: run.id, force: true }, undefined, undefined, ctx);
+	}
+});
+
+test("layout worktree fails clearly outside a git repository", async () => {
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext();
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-ext-worktree-"));
+
+	try {
+		const spawnTool = api.tools.get("spawn_subagent");
+		const res = await spawnTool.execute(
+			"call-worktree-fail",
+			{ agent: "scout", task: "x", mode: "headless", layout: "worktree", cwd: tmp, wait: false },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.strictEqual(res.isError, true);
+		assert.ok(res.content[0].text.includes("worktree"));
+	} finally {
+		fs.rmSync(tmp, { recursive: true, force: true });
+	}
 });
 
 test("subagents command completions suggest subcommands and run ids", () => {
