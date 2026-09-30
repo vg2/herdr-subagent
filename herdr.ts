@@ -87,6 +87,30 @@ export interface HerdrAgent {
 // CLI Execution
 // ---------------------------------------------------------------------------
 
+export class HerdrError extends Error {
+	code: string;
+
+	constructor(code: string, message: string) {
+		super(`herdr error [${code}]: ${message}`);
+		this.name = "HerdrError";
+		this.code = code;
+	}
+}
+
+export const CLEAN_CHILD_ENV: Record<string, string> = {
+	HERDR_ENV: "0",
+	HERDR_PANE_ID: "",
+	HERDR_TAB_ID: "",
+	HERDR_WORKSPACE_ID: "",
+};
+
+export function isNotFoundError(err: unknown): boolean {
+	return (
+		err instanceof HerdrError &&
+		(err.code === "agent_not_found" || err.code === "pane_not_found" || err.code === "tab_not_found")
+	);
+}
+
 export function isHerdrAvailable(): boolean {
 	return process.env.HERDR_ENV === "1";
 }
@@ -113,24 +137,25 @@ export async function herdrExec<T = any>(
 		}
 
 		if (parsed.error) {
-			throw new Error(`herdr error [${parsed.error.code}]: ${parsed.error.message}`);
+			throw new HerdrError(parsed.error.code, parsed.error.message);
 		}
 
 		return (parsed.result ?? parsed) as T;
 	} catch (err: any) {
+		if (err instanceof HerdrError) throw err;
 		if (err.stdout || err.stderr) {
 			const text = (err.stderr || err.stdout || "").trim();
-			let parsedError: string | undefined;
+			let parsedError: { code: string; message: string } | undefined;
 			try {
 				const parsed = JSON.parse(text);
 				if (parsed.error) {
-					parsedError = `herdr error [${parsed.error.code}]: ${parsed.error.message}`;
+					parsedError = parsed.error;
 				}
 			} catch {
 				/* ignore JSON parse failure */
 			}
 			if (parsedError) {
-				throw new Error(parsedError);
+				throw new HerdrError(parsedError.code, parsedError.message);
 			}
 		}
 		throw err;
@@ -140,6 +165,19 @@ export async function herdrExec<T = any>(
 // ---------------------------------------------------------------------------
 // Pane operations
 // ---------------------------------------------------------------------------
+
+export async function isPaneAlive(paneId: string): Promise<boolean> {
+	try {
+		const res = await herdrExec<{ layout: PaneLayout | null }>(["pane", "layout", "--pane", paneId]);
+		const layout = res.layout ?? null;
+		return layout !== null && layout.panes.some((p) => p.pane_id === paneId);
+	} catch (err) {
+		// Only a confirmed "pane_not_found" means the pane is gone; transient
+		// herdr failures must propagate so callers don't declare a live pane dead.
+		if (isNotFoundError(err)) return false;
+		throw err;
+	}
+}
 
 export async function getPaneLayout(paneId?: string): Promise<PaneLayout | null> {
 	try {
@@ -272,8 +310,11 @@ export async function getAgent(target: string): Promise<HerdrAgent | null> {
 	try {
 		const res = await herdrExec<{ agent: HerdrAgent }>(["agent", "get", target]);
 		return res.agent ?? null;
-	} catch {
-		return null;
+	} catch (err: any) {
+		if (isNotFoundError(err)) {
+			return null;
+		}
+		throw err;
 	}
 }
 
@@ -459,7 +500,7 @@ export async function resolveLayoutTarget(options: {
 					paneId: targetPane.pane_id,
 					direction,
 					cwd,
-					env: { HERDR_ENV: "0" },
+					env: CLEAN_CHILD_ENV,
 					focus: false,
 				});
 				return { paneId: pane.pane_id, tabId: existingSubagentsTab.tab_id, layoutMode: "tab" };
@@ -470,7 +511,7 @@ export async function resolveLayoutTarget(options: {
 		const created = await createTab({
 			label: "subagents",
 			cwd,
-			env: { HERDR_ENV: "0" },
+			env: CLEAN_CHILD_ENV,
 			focus: false,
 			workspaceId,
 		});
@@ -487,7 +528,7 @@ export async function resolveLayoutTarget(options: {
 		current: true,
 		direction,
 		cwd,
-		env: { HERDR_ENV: "0" },
+		env: CLEAN_CHILD_ENV,
 		focus: false,
 	});
 	return { paneId: pane.pane_id, tabId: pane.tab_id, layoutMode: "pane" };

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
 import extensionFactory from "../index.ts";
-import { isHerdrAvailable } from "../herdr.ts";
+import { closePane, isHerdrAvailable } from "../herdr.ts";
 
 function createMockExtensionAPI() {
 	const tools = new Map<string, any>();
@@ -197,4 +197,99 @@ test("spawn_subagent in pane mode, collect_subagents, and cleanup", async () => 
 			ctx,
 		);
 	}
+});
+
+test("cleanup command closes open panes and marks paneClosed", async () => {
+	if (!isHerdrAvailable()) return;
+
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext({ mode: "tui" });
+
+	const spawnTool = api.tools.get("spawn_subagent");
+	const abortTool = api.tools.get("abort_subagent");
+	const subagentsCmd = api.commands.get("subagents");
+
+	const spawnResult = await spawnTool.execute(
+		"call-spawn-cleanup",
+		{
+			agent: "scout",
+			task: "Test cleanup",
+			mode: "pane",
+			layout: "pane",
+			wait: false,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+
+	const run = spawnResult.details.runs[0];
+	assert.ok(run?.paneId);
+
+	try {
+		// Run cleanup with force
+		await subagentsCmd.handler("cleanup --force", ctx);
+		assert.ok(ctx.notifications.some((n: any) => n.msg.includes("Cleaned up 1 sub-agent pane")));
+
+		// Status tool should now show run with paneClosed: true
+		const statusTool = api.tools.get("subagent_status");
+		const statusRes = await statusTool.execute("call-status", { ids: [run.id] }, undefined, undefined, ctx);
+		assert.strictEqual(statusRes.details.runs[0].paneClosed, true);
+	} finally {
+		try {
+			await abortTool.execute("call-abort", { id: run.id, force: true }, undefined, undefined, ctx);
+		} catch {
+			/* ignore */
+		}
+	}
+});
+
+test("manually closed pane is reconciled and cleanup handles pane_not_found", async () => {
+	if (!isHerdrAvailable()) return;
+
+	const api = createMockExtensionAPI();
+	extensionFactory(api);
+	const ctx = createMockContext({ mode: "tui" });
+
+	const spawnTool = api.tools.get("spawn_subagent");
+	const statusTool = api.tools.get("subagent_status");
+	const subagentsCmd = api.commands.get("subagents");
+
+	const spawnResult = await spawnTool.execute(
+		"call-spawn-manual-close",
+		{ agent: "scout", task: "Test manual close reconciliation", mode: "pane", layout: "pane", wait: false },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const run = spawnResult.details.runs[0];
+	assert.ok(run?.paneId);
+
+	// Simulate the user closing the pane directly (outside the extension)
+	await closePane(run.paneId);
+
+	// 1. cleanup hits pane_not_found: marks paneClosed without counting it as closed
+	await subagentsCmd.handler("cleanup --force", ctx);
+	assert.ok(
+		ctx.notifications.some((n: any) => n.msg.includes("Cleaned up 0 sub-agent pane(s).")),
+		`expected cleanup to report 0 closed panes, got: ${JSON.stringify(ctx.notifications)}`,
+	);
+
+	// 2. status reconcile marks the run done with paneClosed true
+	let view: any;
+	for (let i = 0; i < 10; i++) {
+		const statusRes = await statusTool.execute(
+			"call-status-manual-close",
+			{ ids: [run.id] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		view = statusRes.details.runs[0];
+		if (view.status === "done" && view.paneClosed) break;
+		await new Promise((r) => setTimeout(r, 300));
+	}
+	assert.strictEqual(view.status, "done");
+	assert.strictEqual(view.paneClosed, true);
 });

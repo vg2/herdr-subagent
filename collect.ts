@@ -165,12 +165,22 @@ export function parseSessionJsonl(filePath: string): HarvestedSessionData | null
  * Harvest final report and usage stats for a run (headless or pane).
  */
 export async function harvestReport(run: SubagentRun): Promise<void> {
+	// Never harvest or overwrite reports for still-running agents.
+	if (run.status === "running") {
+		return;
+	}
+
 	let report = "";
+	let isGenuineReport = false;
 
 	// 1. Primary: report.md written by child to scratch directory
 	try {
 		if (fs.existsSync(run.reportPath)) {
-			report = fs.readFileSync(run.reportPath, "utf-8").trim();
+			const onDisk = fs.readFileSync(run.reportPath, "utf-8").trim();
+			if (onDisk) {
+				report = onDisk;
+				isGenuineReport = true;
+			}
 		}
 	} catch {
 		/* ignore */
@@ -184,6 +194,7 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 			if (sessionData) {
 				if (!report && sessionData.lastAssistantText) {
 					report = sessionData.lastAssistantText.trim();
+					isGenuineReport = true;
 				}
 				// Merge usage stats if run didn't already have them
 				if (sessionData.usage.turns > 0 && run.usage.turns === 0) {
@@ -195,7 +206,7 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 		}
 	}
 
-	// 3. Fallback: herdr agent read (terminal output) for pane runs
+	// 3. Fallback: herdr agent read (terminal output) for pane runs (display only, never persisted)
 	if (!report && run.mode === "pane" && run.agentName && isHerdrAvailable()) {
 		try {
 			const termOutput = await readAgent(run.agentName, {
@@ -215,25 +226,52 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 		report = run.errorMessage || run.stderr.trim() || "(no output)";
 	}
 
-	// Save captured report to reportPath if not already present
-	try {
-		if (!fs.existsSync(run.reportPath)) {
-			fs.writeFileSync(run.reportPath, report, { encoding: "utf-8", mode: 0o600 });
+	// Persisting a report is only safe once the child can no longer change it.
+	// A blocked child may resume after the user answers it, so its intermediate
+	// session text must stay display-only and must never mask the final report.
+	const allowPersist = run.status !== "blocked";
+
+	// Save captured genuine report to reportPath if not already present on disk.
+	// Never persist placeholder "(no output)" or transient terminal scrapes to reportPath.
+	if (isGenuineReport && allowPersist) {
+		try {
+			if (!fs.existsSync(run.reportPath)) {
+				fs.writeFileSync(run.reportPath, report, { encoding: "utf-8", mode: 0o600 });
+			}
+		} catch {
+			/* ignore */
 		}
-	} catch {
-		/* ignore */
 	}
 
 	run.report = report;
 
-	// Send notification if settled and not yet notified
-	if (run.status === "done" && !run.notified) {
-		run.notified = true;
-		if (isHerdrAvailable()) {
+	// Send notification if settled or blocked and not yet notified
+	if (!run.notified && isHerdrAvailable()) {
+		if (run.status === "done") {
+			run.notified = true;
 			const taskSummary = run.task.length > 60 ? `${run.task.slice(0, 60)}...` : run.task;
 			await showNotification(`Sub-agent ${run.agent} done`, {
 				body: taskSummary,
 				sound: "done",
+			});
+		} else if (run.status === "failed") {
+			run.notified = true;
+			const errMsg = run.errorMessage || "Unknown error";
+			const body = errMsg.length > 60 ? `${errMsg.slice(0, 60)}...` : errMsg;
+			await showNotification(`Sub-agent ${run.agent} failed`, {
+				body,
+				sound: "request",
+			});
+		} else if (run.status === "blocked") {
+			run.notified = true;
+			await showNotification(`Sub-agent ${run.agent} waiting for input`, {
+				body: `Sub-agent ${run.id} is blocked and requires input.`,
+				sound: "request",
+			});
+		} else if (run.status === "aborted") {
+			run.notified = true;
+			await showNotification(`Sub-agent ${run.agent} aborted`, {
+				body: `Sub-agent ${run.id} was aborted.`,
 			});
 		}
 	}
@@ -287,22 +325,26 @@ export async function collectRuns(options: {
 				}
 			} catch (err: any) {
 				// If wait failed, check live agent state or process
-				const agent = await getAgent(run.agentName);
-				if (!agent) {
-					// Agent exited
-					run.status = "done";
-					run.endedAt = Date.now();
-				} else if (agent.agent_status === "blocked") {
-					run.status = "blocked";
-				} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-					run.status = "done";
-					run.endedAt = Date.now();
+				try {
+					const agent = await getAgent(run.agentName);
+					if (!agent) {
+						// Confirmed agent exited
+						run.status = "done";
+						run.endedAt = Date.now();
+					} else if (agent.agent_status === "blocked") {
+						run.status = "blocked";
+					} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
+						run.status = "done";
+						run.endedAt = Date.now();
+					}
+				} catch {
+					/* ignore transient error from getAgent */
 				}
 			}
 		}
 
-		await harvestReport(run);
 		if (isSettled(run.status) || run.status === "blocked") {
+			await harvestReport(run);
 			run.collected = true;
 		}
 	};

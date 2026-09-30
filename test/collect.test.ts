@@ -11,6 +11,7 @@ import {
 	collectRuns,
 } from "../collect.ts";
 import { emptyUsage, type SubagentRun } from "../state.ts";
+import { isHerdrAvailable } from "../herdr.ts";
 
 test("findSessionFile locates session by cwd and sessionId", () => {
 	const cwd = process.cwd();
@@ -180,6 +181,183 @@ test("collectRuns harvests already settled runs immediately", async () => {
 		assert.strictEqual(results.length, 1);
 		assert.strictEqual(results[0].report, "Settled run report");
 		assert.strictEqual(results[0].collected, true);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("harvestReport and collectRuns do not poison reportPath while run is running", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-running-"));
+	const reportPath = path.join(tmpDir, "report.md");
+
+	const run: SubagentRun = {
+		id: "sa-test-running",
+		agent: "scout",
+		agentSource: "user",
+		task: "Long running task",
+		cwd: process.cwd(),
+		status: "running",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: tmpDir,
+		reportPath,
+		collected: false,
+		report: "",
+		mode: "headless",
+		abort: () => {},
+	};
+
+	try {
+		// 1. Direct harvestReport call on running run does not create report.md
+		await harvestReport(run);
+		assert.strictEqual(run.report, "");
+		assert.strictEqual(fs.existsSync(reportPath), false);
+
+		// 2. collectRuns with timeout does not mark collected or create report.md
+		// Create a headless pending promise that does not settle in 100ms
+		const pendingPromises = new Map<string, Promise<void>>();
+		const neverResolving = new Promise<void>(() => {});
+		pendingPromises.set(run.id, neverResolving);
+
+		const results = await collectRuns({ runs: [run], timeoutMs: 100, pendingPromises });
+		assert.strictEqual(results[0].status, "running");
+		assert.strictEqual(results[0].collected, false);
+		assert.strictEqual(fs.existsSync(reportPath), false);
+
+		// 3. Now simulate run completing and writing session JSONL
+		run.status = "done";
+		run.sessionId = "subsequent-complete-uuid";
+
+		const baseDir = path.join(getAgentDir(), "sessions");
+		const slug = "--" + path.resolve(run.cwd).replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-") + "--";
+		const groupDir = path.join(baseDir, slug);
+		fs.mkdirSync(groupDir, { recursive: true });
+
+		const sessionFile = path.join(groupDir, `2026-09-29T00-00-00-000Z_${run.sessionId}.jsonl`);
+		const sessionLines = [
+			JSON.stringify({ type: "session", version: 3, id: run.sessionId, cwd: run.cwd }),
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Genuine completed report from assistant" }],
+					usage: { input: 100, output: 50, cost: { total: 0.001 }, totalTokens: 150 },
+				},
+			}),
+		];
+		fs.writeFileSync(sessionFile, sessionLines.join("\n"), "utf-8");
+
+		try {
+			await harvestReport(run);
+			assert.strictEqual(run.report, "Genuine completed report from assistant");
+			// Genuine report was saved to reportPath
+			assert.strictEqual(fs.existsSync(reportPath), true);
+			assert.strictEqual(fs.readFileSync(reportPath, "utf-8"), "Genuine completed report from assistant");
+		} finally {
+			if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
+		}
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("harvestReport keeps blocked-run text display-only so a later harvest reads the final report", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-blocked-"));
+	const reportPath = path.join(tmpDir, "report.md");
+
+	const run: SubagentRun = {
+		id: "sa-test-blocked",
+		agent: "reviewer",
+		agentSource: "user",
+		task: "Blocked task",
+		cwd: process.cwd(),
+		status: "blocked",
+		startedAt: Date.now() - 1000,
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: tmpDir,
+		reportPath,
+		collected: false,
+		report: "",
+		mode: "pane",
+		abort: () => {},
+	};
+
+	const sessionId = "blocked-harvest-uuid";
+	run.sessionId = sessionId;
+	const baseDir = path.join(getAgentDir(), "sessions");
+	const slug = "--" + path.resolve(run.cwd).replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-") + "--";
+	const groupDir = path.join(baseDir, slug);
+	fs.mkdirSync(groupDir, { recursive: true });
+	const sessionFile = path.join(groupDir, `2026-09-29T00-00-00-000Z_${sessionId}.jsonl`);
+
+	const assistantLine = (text: string) =>
+		JSON.stringify({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text }],
+				usage: { input: 10, output: 5, cost: { total: 0.0001 }, totalTokens: 15 },
+			},
+		});
+
+	fs.writeFileSync(
+		sessionFile,
+		[
+			JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: run.cwd }),
+			assistantLine("Intermediate text while blocked"),
+		].join("\n"),
+		"utf-8",
+	);
+
+	try {
+		await harvestReport(run);
+		assert.strictEqual(run.report, "Intermediate text while blocked");
+		assert.strictEqual(fs.existsSync(reportPath), false, "blocked-run text must not be persisted to reportPath");
+
+		// Child is unblocked and finishes: the final assistant message lands in the session
+		fs.appendFileSync(sessionFile, `\n${assistantLine("Final report after unblock")}\n`, "utf-8");
+		run.status = "done";
+
+		await harvestReport(run);
+		assert.strictEqual(run.report, "Final report after unblock");
+		assert.strictEqual(fs.readFileSync(reportPath, "utf-8"), "Final report after unblock");
+	} finally {
+		if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("harvestReport marks aborted runs as notified", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-aborted-"));
+
+	const run: SubagentRun = {
+		id: "sa-test-aborted",
+		agent: "worker",
+		agentSource: "user",
+		task: "Aborted task",
+		cwd: process.cwd(),
+		status: "aborted",
+		startedAt: Date.now() - 1000,
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: tmpDir,
+		reportPath: path.join(tmpDir, "report.md"),
+		collected: false,
+		report: "",
+		mode: "headless",
+		abort: () => {},
+	};
+
+	try {
+		await harvestReport(run);
+		if (isHerdrAvailable()) {
+			assert.strictEqual(run.notified, true);
+		}
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}

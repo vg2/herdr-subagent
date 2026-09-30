@@ -12,6 +12,10 @@ import {
 	closeTab,
 	resolveLayoutTarget,
 	showNotification,
+	getAgent,
+	isPaneAlive,
+	isNotFoundError,
+	HerdrError,
 } from "../herdr.ts";
 
 test("isHerdrAvailable returns true when HERDR_ENV is 1", () => {
@@ -134,6 +138,43 @@ test("resolveLayoutTarget resolves pane and tab topology", async () => {
 	});
 	assert.strictEqual(autoTarget2.layoutMode, "tab");
 	await closeTab(autoTarget2.tabId);
+});
+
+test("getAgent returns null on agent_not_found and handles HerdrError", async () => {
+	if (!isHerdrAvailable()) return;
+
+	const nonExistent = await getAgent("nonexistent-test-agent-99999");
+	assert.strictEqual(nonExistent, null);
+
+	// herdrExec surfaces error codes as a typed HerdrError that isNotFoundError classifies
+	let caught: unknown;
+	try {
+		await herdrExec(["pane", "close", "nonexistent-pane-99999"]);
+	} catch (err) {
+		caught = err;
+	}
+	assert.ok(caught instanceof HerdrError);
+	assert.strictEqual(isNotFoundError(caught), true);
+});
+
+test("isPaneAlive correctly detects active vs nonexistent pane", async () => {
+	if (!isHerdrAvailable()) return;
+
+	// Nonexistent pane
+	const dead = await isPaneAlive("nonexistent-pane-id-999");
+	assert.strictEqual(dead, false);
+
+	// Create real pane, test alive, close it, test dead
+	const pane = await splitPane({
+		current: true,
+		direction: "right",
+		cwd: process.cwd(),
+		focus: false,
+	});
+	assert.strictEqual(await isPaneAlive(pane.pane_id), true);
+
+	await closePane(pane.pane_id);
+	assert.strictEqual(await isPaneAlive(pane.pane_id), false);
 });
 
 test("showNotification does not throw", async () => {

@@ -8,8 +8,8 @@ import {
 	createRunDir,
 	startPane,
 } from "../spawner.ts";
-import { isHerdrAvailable, getAgent } from "../herdr.ts";
-import { emptyUsage, type SubagentRun } from "../state.ts";
+import { isHerdrAvailable, getAgent, listAgents } from "../herdr.ts";
+import { emptyUsage, type SubagentRun, RunRegistry } from "../state.ts";
 import type { AgentConfig } from "../agents.ts";
 
 test("resolveSpawnMode resolves according to Plan 3.1", () => {
@@ -58,6 +58,160 @@ test("buildDelegationPrompt builds prompt containing task, scope, deliverable an
 	assert.ok(prompt.includes("/tmp/report.md"));
 	assert.ok(prompt.includes("## Cross-agent policy"));
 	assert.ok(prompt.includes("cannot contact other agents directly"));
+});
+
+test("RunRegistry.nextId enforces length <= 32 and avoids collisions", () => {
+	const registry = new RunRegistry();
+
+	// Normal short name
+	const id1 = registry.nextId("scout");
+	assert.strictEqual(id1, "sa-scout-1");
+	assert.ok(id1.length <= 32);
+
+	// Very long persona name (e.g. 50 characters)
+	const longName = "super-long-codebase-migration-refactoring-specialist-expert";
+	const id2 = registry.nextId(longName);
+	assert.ok(id2.length <= 32);
+	assert.ok(id2.startsWith("sa-"));
+	assert.ok(id2.endsWith("-2"));
+
+	// Collision avoidance against live agents
+	const liveAgents = ["sa-worker-3", "sa-worker-4"];
+	const id3 = registry.nextId("worker", liveAgents);
+	assert.strictEqual(id3, "sa-worker-5"); // 3 and 4 were occupied, jumps to 5
+	assert.ok(id3.length <= 32);
+});
+
+test("RunRegistry.openPaneRuns counts open panes and ignores closed ones", () => {
+	const registry = new RunRegistry();
+
+	const run1: SubagentRun = {
+		id: "sa-test-1",
+		agent: "scout",
+		agentSource: "user",
+		task: "task 1",
+		cwd: "/tmp",
+		status: "done", // done, but pane is still open!
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: "/tmp",
+		reportPath: "/tmp/report.md",
+		collected: false,
+		report: "",
+		mode: "pane",
+		paneId: "wF:p1",
+		paneClosed: false,
+		abort: () => {},
+	};
+
+	const run2: SubagentRun = {
+		id: "sa-test-2",
+		agent: "worker",
+		agentSource: "user",
+		task: "task 2",
+		cwd: "/tmp",
+		status: "done",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: "/tmp",
+		reportPath: "/tmp/report.md",
+		collected: false,
+		report: "",
+		mode: "pane",
+		paneId: "wF:p2",
+		paneClosed: true, // pane was closed
+		abort: () => {},
+	};
+
+	const run3: SubagentRun = {
+		id: "sa-test-3",
+		agent: "planner",
+		agentSource: "user",
+		task: "task 3",
+		cwd: "/tmp",
+		status: "running",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: "/tmp",
+		reportPath: "/tmp/report.md",
+		collected: false,
+		report: "",
+		mode: "headless", // headless
+		abort: () => {},
+	};
+
+	registry.add(run1);
+	registry.add(run2);
+	registry.add(run3);
+
+	const openPanes = registry.openPaneRuns();
+	assert.strictEqual(openPanes.length, 1);
+	assert.strictEqual(openPanes[0].id, "sa-test-1");
+
+	// excludeId excludes the specified run
+	assert.strictEqual(registry.openPaneRuns("sa-test-1").length, 0);
+});
+
+test("nextId dedupes against a live Herdr agent from a previous session", async () => {
+	if (!isHerdrAvailable()) return;
+
+	const id = "sa-livetest-1";
+	const dir = createRunDir(id);
+
+	const persona: AgentConfig = {
+		name: "livetest",
+		description: "Live-agent name dedupe test",
+		tools: ["read"],
+		model: "opencode-go/glm-5.3-flash",
+		thinking: "low",
+		systemPrompt: "You are a test agent.",
+		source: "user",
+	};
+
+	const run: SubagentRun = {
+		id,
+		agent: persona.name,
+		agentSource: persona.source,
+		task: "Name dedupe test",
+		cwd: process.cwd(),
+		status: "running",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir,
+		reportPath: path.join(dir, "report.md"),
+		collected: false,
+		report: "",
+		mode: "pane",
+		abort: () => {},
+	};
+
+	try {
+		await startPane({
+			run,
+			persona,
+			delegationPrompt: "Reply with the single word: ready",
+			layout: "pane",
+			activePaneCount: 0,
+		});
+
+		const agents = await listAgents();
+		const liveNames = agents.map((a) => a.name || a.agent);
+		assert.ok(liveNames.includes(id), `expected live agent ${id}, got: ${liveNames.join(", ")}`);
+
+		// A restarted parent session gets a fresh registry; it must not reuse the live name
+		const fresh = new RunRegistry();
+		assert.strictEqual(fresh.nextId("livetest", liveNames), "sa-livetest-2");
+	} finally {
+		await run.abort("test cleanup");
+	}
 });
 
 test("startPane creates pane child and abort cleans it up", async () => {

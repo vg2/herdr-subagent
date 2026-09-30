@@ -63,6 +63,7 @@ export interface SubagentRun {
 	agentName?: string;
 	sessionId?: string;
 	notified?: boolean;
+	paneClosed?: boolean;
 }
 
 /** Plain, serializable snapshot used in tool `details`, session entries, and status output. */
@@ -96,6 +97,7 @@ export interface RunView {
 	tabId?: string;
 	agentName?: string;
 	sessionId?: string;
+	paneClosed?: boolean;
 }
 
 export const REPORT_CAP_BYTES = 50 * 1024;
@@ -165,6 +167,7 @@ export function toView(run: SubagentRun, options: { includeReport?: boolean } = 
 		tabId: run.tabId,
 		agentName: run.agentName,
 		sessionId: run.sessionId,
+		paneClosed: run.paneClosed,
 	};
 
 	if (options.includeReport && run.status !== "running") {
@@ -180,10 +183,33 @@ export class RunRegistry {
 	private runs = new Map<string, SubagentRun>();
 	private counter = 0;
 
-	nextId(agentName: string): string {
+	nextId(agentName: string, liveAgentNames?: Iterable<string>): string {
 		this.counter += 1;
-		const safe = agentName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
-		return `sa-${safe}-${this.counter}`;
+		const clean =
+			agentName
+				.toLowerCase()
+				.replace(/[^a-z0-9_-]+/g, "-")
+				.replace(/^-+|-+$/g, "") || "agent";
+
+		const liveSet = new Set<string>(liveAgentNames ?? []);
+		for (const r of this.runs.values()) {
+			if (r.agentName) liveSet.add(r.agentName);
+			liveSet.add(r.id);
+		}
+
+		while (true) {
+			const suffix = `-${this.counter}`;
+			// Herdr agent names must match [a-z][a-z0-9_-]{0,31} (max 32 chars total).
+			// Prefix "sa-" is 3 chars.
+			const maxBaseLen = 32 - 3 - suffix.length;
+			const truncatedBase = clean.slice(0, Math.max(1, maxBaseLen)).replace(/-+$/, "") || "ag";
+			const candidate = `sa-${truncatedBase}${suffix}`;
+
+			if (!liveSet.has(candidate)) {
+				return candidate;
+			}
+			this.counter += 1;
+		}
 	}
 
 	add(run: SubagentRun): void {
@@ -202,14 +228,21 @@ export class RunRegistry {
 		this.runs.delete(id);
 	}
 
+	/** Runs with an open Herdr pane (whether running, done, or blocked). */
+	openPaneRuns(excludeId?: string): SubagentRun[] {
+		return Array.from(this.runs.values()).filter(
+			(r) => r.mode === "pane" && Boolean(r.paneId) && !r.paneClosed && r.id !== excludeId,
+		);
+	}
+
 	activePaneRuns(): SubagentRun[] {
 		return Array.from(this.runs.values()).filter(
-			(r) => r.status === "running" && r.mode === "pane",
+			(r) => r.status === "running" && r.mode === "pane" && !r.paneClosed,
 		);
 	}
 
 	findByPaneId(paneId: string): SubagentRun | undefined {
-		return Array.from(this.runs.values()).find((r) => r.paneId === paneId);
+		return Array.from(this.runs.values()).find((r) => r.paneId === paneId && !r.paneClosed);
 	}
 
 	findByAgentName(agentName: string): SubagentRun | undefined {

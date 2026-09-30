@@ -24,6 +24,8 @@ import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-ag
 import { type AgentConfig, isThinkingLevel } from "./agents.ts";
 import {
 	closePane,
+	getAgent,
+	HerdrError,
 	isHerdrAvailable,
 	promptAgent,
 	resolveLayoutTarget,
@@ -583,6 +585,7 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 	run.paneId = target.paneId;
 	run.tabId = target.tabId;
 	run.agentName = run.id;
+	run.paneClosed = false;
 
 	const args: string[] = [
 		"--session-id",
@@ -617,8 +620,9 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 		}
 		await new Promise((r) => setTimeout(r, 1000));
 		try {
-			if (run.paneId) {
+			if (run.paneId && !run.paneClosed) {
 				await closePane(run.paneId);
+				run.paneClosed = true;
 			}
 		} catch {
 			/* ignore */
@@ -642,18 +646,47 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 		);
 	}
 
-	await startAgent({
-		name: run.agentName,
-		kind: "pi",
-		paneId: run.paneId,
-		timeoutMs: 60000,
-		args,
-	});
+	try {
+		await startAgent({
+			name: run.agentName,
+			kind: "pi",
+			paneId: run.paneId,
+			timeoutMs: 60000,
+			args,
+		});
 
-	await promptAgent(run.agentName, delegationPrompt, {
-		wait: true,
-		until: ["working", "done", "idle"],
-		timeoutMs: 15000,
-	});
+		try {
+			await promptAgent(run.agentName, delegationPrompt, {
+				wait: true,
+				until: ["working", "done", "idle"],
+				timeoutMs: 15000,
+			});
+		} catch (promptErr: any) {
+			// If prompt_stalled or timeout occurred, check if the agent is still running.
+			// If alive in Herdr, the prompt was accepted and the child is running.
+			const isStalledOrTimeout =
+				promptErr instanceof HerdrError &&
+				(promptErr.code === "agent_prompt_stalled" || promptErr.code === "timeout");
+			if (isStalledOrTimeout) {
+				const agent = await getAgent(run.agentName).catch(() => null);
+				if (agent) {
+					// Agent is alive and received the prompt; do not abort/fail the spawn
+					return;
+				}
+			}
+			throw promptErr;
+		}
+	} catch (err) {
+		// Clean up created pane so we don't leak orphaned panes
+		if (run.paneId && !run.paneClosed) {
+			try {
+				await closePane(run.paneId);
+				run.paneClosed = true;
+			} catch {
+				/* ignore */
+			}
+		}
+		throw err;
+	}
 }
 

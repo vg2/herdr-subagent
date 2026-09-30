@@ -39,11 +39,16 @@ import {
 import { collectRuns, harvestReport } from "./collect.ts";
 import {
 	closePane,
+	closeTab,
 	focusAgent,
 	focusTab,
 	getAgent,
 	isHerdrAvailable,
+	isNotFoundError,
+	isPaneAlive,
 	listAgents,
+	listPanes,
+	listTabs,
 } from "./herdr.ts";
 import {
 	buildDelegationPrompt,
@@ -389,21 +394,28 @@ export default function (pi: ExtensionAPI) {
 
 		for (const run of activePanes) {
 			if (!run.agentName) continue;
-			const agent = await getAgent(run.agentName);
-			if (!agent) {
-				// Child exited
-				run.status = "done";
-				run.endedAt = Date.now();
-				await harvestReport(run);
-				pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-			} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-				run.status = "done";
-				run.endedAt = Date.now();
-				await harvestReport(run);
-				pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-			} else if (agent.agent_status === "blocked") {
-				run.status = "blocked";
-				await harvestReport(run);
+			try {
+				const agent = await getAgent(run.agentName);
+				if (!agent) {
+					// Agent is confirmed gone (transient errors are rethrown by getAgent).
+					// Pane existence only decides whether a pane is still open to clean up.
+					const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
+					run.paneClosed = !paneAlive;
+					run.status = "done";
+					run.endedAt = Date.now();
+					await harvestReport(run);
+					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
+				} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
+					run.status = "done";
+					run.endedAt = Date.now();
+					await harvestReport(run);
+					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
+				} else if (agent.agent_status === "blocked") {
+					run.status = "blocked";
+					await harvestReport(run);
+				}
+			} catch {
+				/* transient herdr error, keep run as running */
 			}
 		}
 	};
@@ -415,14 +427,17 @@ export default function (pi: ExtensionAPI) {
 		if (typeof pollTimer.unref === "function") pollTimer.unref();
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		if (pollTimer) {
 			clearInterval(pollTimer);
 			pollTimer = undefined;
 		}
-		for (const run of registry.list()) {
-			if (run.status === "running") void run.abort("session shutdown");
-		}
+		const abortPromises = registry
+			.list()
+			.filter((run) => run.status === "running")
+			.map((run) => Promise.resolve(run.abort("session shutdown")));
+		await Promise.allSettled(abortPromises);
+
 		for (const dir of createdDirs) {
 			try {
 				fs.rmSync(dir, { recursive: true, force: true });
@@ -454,6 +469,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			ctxInfo = { registry: ctx.modelRegistry, cwd: ctx.cwd };
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 
@@ -543,7 +559,17 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const id = registry.nextId(persona.name);
+			let liveNames: string[] = [];
+			if (isHerdrAvailable()) {
+				try {
+					const agents = await listAgents();
+					liveNames = agents.map((a) => a.name || a.agent);
+				} catch {
+					/* ignore */
+				}
+			}
+
+			const id = registry.nextId(persona.name, liveNames);
 			const dir = createRunDir(id);
 			createdDirs.add(dir);
 			const reportPath = path.join(dir, "report.md");
@@ -594,12 +620,20 @@ export default function (pi: ExtensionAPI) {
 						delegationPrompt,
 						layout: params.layout ?? "auto",
 						signal,
-						activePaneCount: registry.activePaneRuns().length,
+						activePaneCount: registry.openPaneRuns(run.id).length,
 					});
 				} catch (err: any) {
 					run.status = "failed";
 					run.errorMessage = err.message || String(err);
 					run.endedAt = Date.now();
+					if (run.paneId && !run.paneClosed) {
+						try {
+							await closePane(run.paneId);
+							run.paneClosed = true;
+						} catch {
+							/* ignore */
+						}
+					}
 					return {
 						content: [{ type: "text", text: `Failed to spawn sub-agent in Herdr pane: ${run.errorMessage}` }],
 						details: { mode: "pane", runs: [toView(run)] },
@@ -621,8 +655,28 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Blocking collection
-				await collectRuns({ runs: [run], timeoutMs: 300000, pendingPromises: pending });
+				// Blocking collection with progress updates. If the parent tool call
+				// is aborted, stop waiting (the fire-and-forget child keeps running).
+				const pollInterval = 1000;
+				let settled = false;
+				const collectPromise = collectRuns({ runs: [run], timeoutMs: 300000, pendingPromises: pending })
+					.finally(() => {
+						settled = true;
+					});
+
+				while (!settled && !signal?.aborted) {
+					emitSpawnUpdate(onUpdate, run);
+					await Promise.race([
+						collectPromise,
+						new Promise((r) => setTimeout(r, pollInterval)),
+					]);
+				}
+				if (signal?.aborted) {
+					void collectPromise.catch(() => {});
+				} else {
+					await collectPromise;
+				}
+
 				const view = toView(run, { includeReport: true });
 				const { text, truncated } = truncateBytes(run.report || "(no output)");
 				const usageStr = formatUsageStats(view.usage, view.model);
@@ -884,17 +938,23 @@ export default function (pi: ExtensionAPI) {
 				// Reconcile non-waiting runs
 				for (const run of selected) {
 					if (run.mode === "pane" && run.agentName && isHerdrAvailable()) {
-						const agent = await getAgent(run.agentName);
-						if (!agent) {
-							if (run.status === "running") {
+						try {
+							const agent = await getAgent(run.agentName);
+							if (!agent) {
+								const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
+								run.paneClosed = !paneAlive;
+								if (run.status === "running") {
+									run.status = "done";
+									run.endedAt = Date.now();
+								}
+							} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
 								run.status = "done";
-								run.endedAt = Date.now();
+								run.endedAt ??= Date.now();
+							} else if (agent.agent_status === "blocked") {
+								run.status = "blocked";
 							}
-						} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-							run.status = "done";
-							run.endedAt ??= Date.now();
-						} else if (agent.agent_status === "blocked") {
-							run.status = "blocked";
+						} catch {
+							/* transient error, keep status */
 						}
 					}
 					if (isSettled(run.status)) {
@@ -1201,7 +1261,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (action === "cleanup") {
 				const force = args.includes("--force") || args.includes("-f");
-				const paneRuns = registry.list().filter((r) => r.mode === "pane" && r.paneId);
+				const paneRuns = registry.list().filter((r) => r.mode === "pane" && r.paneId && !r.paneClosed);
 				let closedCount = 0;
 				let skippedCount = 0;
 
@@ -1213,9 +1273,32 @@ export default function (pi: ExtensionAPI) {
 					}
 					try {
 						await closePane(r.paneId);
+						r.paneClosed = true;
 						closedCount++;
+					} catch (err) {
+						if (isNotFoundError(err)) {
+							// Pane is already gone: mark closed so layout/status stop counting it.
+							r.paneClosed = true;
+						}
+						// Any other (transient) failure leaves paneClosed false so cleanup can retry.
+					}
+				}
+
+				// Check if dedicated "subagents" tab is now empty and can be closed
+				if (isHerdrAvailable()) {
+					try {
+						const workspaceId = process.env.HERDR_WORKSPACE_ID;
+						const tabs = await listTabs(workspaceId);
+						const subagentsTab = tabs.find((t) => t.label === "subagents");
+						if (subagentsTab) {
+							const panes = await listPanes(workspaceId);
+							const remainingInTab = panes.filter((p) => p.tab_id === subagentsTab.tab_id);
+							if (remainingInTab.length === 0) {
+								await closeTab(subagentsTab.tab_id);
+							}
+						}
 					} catch {
-						/* ignore already closed panes */
+						/* ignore tab close failure */
 					}
 				}
 
