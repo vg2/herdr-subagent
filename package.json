@@ -20,6 +20,10 @@
     "url": "https://github.com/vg2/herdr-subagent/issues"
   },
   "homepage": "https://github.com/vg2/herdr-subagent#readme",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",

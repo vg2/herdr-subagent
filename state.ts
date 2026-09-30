@@ -11,7 +11,9 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentSource } from "./agents.ts";
 
-export type RunStatus = "running" | "done" | "failed" | "aborted";
+export type RunStatus = "running" | "done" | "failed" | "aborted" | "blocked";
+export type SpawnMode = "pane" | "headless";
+export type LayoutChoice = "auto" | "pane" | "tab";
 
 export interface UsageStats {
 	input: number;
@@ -51,7 +53,16 @@ export interface SubagentRun {
 	collected: boolean;
 	/** Human-readable collection/view, recomputed on settle. */
 	report: string;
-	abort: (reason?: string) => void;
+	abort: (reason?: string) => Promise<void> | void;
+
+	// Phase 2 herdr pane fields
+	mode: SpawnMode;
+	layout?: LayoutChoice;
+	paneId?: string;
+	tabId?: string;
+	agentName?: string;
+	sessionId?: string;
+	notified?: boolean;
 }
 
 /** Plain, serializable snapshot used in tool `details`, session entries, and status output. */
@@ -77,6 +88,14 @@ export interface RunView {
 	collected: boolean;
 	report?: string;
 	reportTruncated?: boolean;
+
+	// Phase 2 herdr pane fields
+	mode: SpawnMode;
+	layout?: LayoutChoice;
+	paneId?: string;
+	tabId?: string;
+	agentName?: string;
+	sessionId?: string;
 }
 
 export const REPORT_CAP_BYTES = 50 * 1024;
@@ -140,6 +159,12 @@ export function toView(run: SubagentRun, options: { includeReport?: boolean } = 
 		stderr: run.stderr || undefined,
 		reportPath: run.reportPath,
 		collected: run.collected,
+		mode: run.mode,
+		layout: run.layout,
+		paneId: run.paneId,
+		tabId: run.tabId,
+		agentName: run.agentName,
+		sessionId: run.sessionId,
 	};
 
 	if (options.includeReport && run.status !== "running") {
@@ -175,6 +200,20 @@ export class RunRegistry {
 
 	remove(id: string): void {
 		this.runs.delete(id);
+	}
+
+	activePaneRuns(): SubagentRun[] {
+		return Array.from(this.runs.values()).filter(
+			(r) => r.status === "running" && r.mode === "pane",
+		);
+	}
+
+	findByPaneId(paneId: string): SubagentRun | undefined {
+		return Array.from(this.runs.values()).find((r) => r.paneId === paneId);
+	}
+
+	findByAgentName(agentName: string): SubagentRun | undefined {
+		return Array.from(this.runs.values()).find((r) => r.agentName === agentName);
 	}
 
 	clear(): void {

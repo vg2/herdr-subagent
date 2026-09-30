@@ -13,6 +13,7 @@
  */
 
 import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,7 +22,15 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type AgentConfig, isThinkingLevel } from "./agents.ts";
-import type { SubagentRun } from "./state.ts";
+import {
+	closePane,
+	isHerdrAvailable,
+	promptAgent,
+	resolveLayoutTarget,
+	sendKeys,
+	startAgent,
+} from "./herdr.ts";
+import type { LayoutChoice, SpawnMode, SubagentRun } from "./state.ts";
 
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const GUARD_PATH = path.join(EXTENSION_DIR, "guard.ts");
@@ -514,3 +523,137 @@ export function extensionDir(): string {
 export function userAgentsDir(): string {
 	return path.join(getAgentDir(), "agents");
 }
+
+/**
+ * Resolve dispatch mode according to Plan 3.1:
+ *   - "pane": default when HERDR_ENV=1 and ctx.mode === "tui"
+ *   - "headless": fallback when no herdr or ctx.mode !== "tui"
+ */
+export function resolveSpawnMode(
+	requestedMode: "auto" | "pane" | "headless" | undefined,
+	ctxMode: string,
+): { mode: SpawnMode; error?: string } {
+	if (requestedMode === "pane") {
+		if (!isHerdrAvailable()) {
+			return { mode: "pane", error: "Herdr is not available (HERDR_ENV !== 1). Cannot spawn in pane mode." };
+		}
+		if (ctxMode !== "tui") {
+			return { mode: "pane", error: `Pane mode requires interactive TUI mode (current mode: ${ctxMode}).` };
+		}
+		return { mode: "pane" };
+	}
+
+	if (requestedMode === "headless") {
+		return { mode: "headless" };
+	}
+
+	// "auto" (default)
+	if (isHerdrAvailable() && ctxMode === "tui") {
+		return { mode: "pane" };
+	}
+	return { mode: "headless" };
+}
+
+export interface PaneSpawnOptions {
+	run: SubagentRun;
+	persona: AgentConfig;
+	delegationPrompt: string;
+	layout: LayoutChoice;
+	signal?: AbortSignal;
+	activePaneCount: number;
+}
+
+/**
+ * Start a sub-agent inside an interactive Herdr pane (Plan 3.1 & 3.5 & 4 Phase 2).
+ * Returns once the child process is started and the initial prompt has reached `working`.
+ */
+export async function startPane(options: PaneSpawnOptions): Promise<void> {
+	const { run, persona, delegationPrompt, layout, signal, activePaneCount } = options;
+
+	run.mode = "pane";
+	run.layout = layout;
+	run.sessionId = crypto.randomUUID();
+
+	const target = await resolveLayoutTarget({
+		layout,
+		cwd: run.cwd,
+		activePaneSubagentsCount: activePaneCount,
+	});
+
+	run.paneId = target.paneId;
+	run.tabId = target.tabId;
+	run.agentName = run.id;
+
+	const args: string[] = [
+		"--session-id",
+		run.sessionId,
+		"--name",
+		run.id,
+		"--no-extensions",
+		"--no-skills",
+		"-e",
+		GUARD_PATH,
+	];
+
+	if (run.model) args.push("--model", run.model);
+	if (run.thinking) args.push("--thinking", run.thinking);
+	if (persona.tools && persona.tools.length > 0) args.push("--tools", persona.tools.join(","));
+
+	let personaPath: string | null = null;
+	if (persona.systemPrompt.trim()) {
+		personaPath = path.join(run.dir, "persona.md");
+		const systemPrompt = `${persona.systemPrompt.trim()}\n\n## Cross-agent policy\n${CROSS_AGENT_POLICY}\n`;
+		writePrivate(personaPath, systemPrompt);
+		args.push("--append-system-prompt", personaPath);
+	}
+
+	run.abort = async (reason?: string) => {
+		try {
+			if (run.agentName) {
+				await sendKeys(run.agentName, "ctrl+c");
+			}
+		} catch {
+			/* ignore */
+		}
+		await new Promise((r) => setTimeout(r, 1000));
+		try {
+			if (run.paneId) {
+				await closePane(run.paneId);
+			}
+		} catch {
+			/* ignore */
+		}
+		run.status = "aborted";
+		run.stopReason = reason ?? "aborted";
+		run.endedAt = Date.now();
+	};
+
+	if (signal) {
+		if (signal.aborted) {
+			await run.abort("aborted by caller");
+			return;
+		}
+		signal.addEventListener(
+			"abort",
+			() => {
+				void run.abort("aborted by caller");
+			},
+			{ once: true },
+		);
+	}
+
+	await startAgent({
+		name: run.agentName,
+		kind: "pi",
+		paneId: run.paneId,
+		timeoutMs: 60000,
+		args,
+	});
+
+	await promptAgent(run.agentName, delegationPrompt, {
+		wait: true,
+		until: ["working", "done", "idle"],
+		timeoutMs: 15000,
+	});
+}
+
