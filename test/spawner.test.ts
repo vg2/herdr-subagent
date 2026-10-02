@@ -8,15 +8,28 @@ import {
 	childEnv,
 	childIdentityEnv,
 	childToolAllowlist,
+	deliverPanePrompt,
 	paneChildEnv,
+	PanePromptError,
 	resolveSpawnMode,
 	resolveModel,
 	buildDelegationPrompt,
 	createRunDir,
 	startPane,
+	type PanePromptBackend,
 } from "../spawner.ts";
 import { ISSUE_TOOL_NAMES } from "../issues.ts";
-import { isHerdrAvailable, getAgent, listAgents, closePane, isPaneAlive, listWorkspaces, closeWorkspace } from "../herdr.ts";
+import {
+	HerdrError,
+	isHerdrAvailable,
+	getAgent,
+	listAgents,
+	closePane,
+	isPaneAlive,
+	listWorkspaces,
+	closeWorkspace,
+	type HerdrAgent,
+} from "../herdr.ts";
 import { emptyUsage, type SubagentRun, RunRegistry } from "../state.ts";
 import type { AgentConfig } from "../agents.ts";
 import { prepareWorktree, removeGitWorktree, type PreparedWorktree } from "../worktree.ts";
@@ -441,6 +454,190 @@ test("startPane worktree layout runs in a sanitized split pane and closes the sh
 		}
 		fs.rmSync(parent, { recursive: true, force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// deliverPanePrompt: confirmed pane prompt delivery (issue #1)
+// ---------------------------------------------------------------------------
+
+function makePaneRun(id: string): SubagentRun {
+	return {
+		id,
+		agent: "worker",
+		agentSource: "user",
+		task: "task",
+		cwd: "/tmp",
+		status: "running",
+		startedAt: Date.now(),
+		messages: [],
+		usage: emptyUsage(),
+		stderr: "",
+		dir: "/tmp",
+		reportPath: "/tmp/report.md",
+		collected: false,
+		report: "",
+		mode: "pane",
+		agentName: id,
+		paneId: "wZ:p9",
+		abort: () => {},
+	};
+}
+
+function fakeAgent(status: string, name: string): HerdrAgent {
+	return {
+		agent: name,
+		name,
+		agent_status: status,
+		pane_id: "wZ:p9",
+		tab_id: "tab-9",
+		workspace_id: "ws-9",
+	};
+}
+
+function paneBackend(overrides: Partial<PanePromptBackend> = {}): PanePromptBackend {
+	return {
+		promptAgent: async () => {
+			throw new Error("unexpected promptAgent call");
+		},
+		waitAgent: async () => {
+			throw new Error("unexpected waitAgent call");
+		},
+		getAgent: async () => {
+			throw new Error("unexpected getAgent call");
+		},
+		sendKeys: async () => {},
+		...overrides,
+	};
+}
+
+test("deliverPanePrompt resolves and records evidence when herdr confirms working", async () => {
+	const run = makePaneRun("sa-dp-working");
+	const backend = paneBackend({
+		promptAgent: async () => fakeAgent("working", run.agentName!),
+	});
+
+	await deliverPanePrompt(run, "do the task", backend);
+	assert.strictEqual(run.sawWorking, true);
+});
+
+test("deliverPanePrompt retries a stalled prompt with an explicit Enter keypress", async () => {
+	const run = makePaneRun("sa-dp-retry");
+	const sentKeys: string[][] = [];
+	const backend = paneBackend({
+		promptAgent: async () => {
+			throw new HerdrError("agent_prompt_stalled", "prompt never observed as submitted");
+		},
+		waitAgent: async () => fakeAgent("working", run.agentName!),
+		sendKeys: async (_target, ...keys) => {
+			sentKeys.push(keys);
+		},
+	});
+
+	await deliverPanePrompt(run, "do the task", backend);
+	assert.strictEqual(run.sawWorking, true, "the retry that confirmed working records evidence");
+	assert.deepStrictEqual(sentKeys, [["enter"]], "exactly one Enter keypress re-submits the stalled prompt");
+});
+
+test("deliverPanePrompt rejects with PanePromptError when an alive idle child never processed the prompt", async () => {
+	const run = makePaneRun("sa-dp-stalled");
+	const backend = paneBackend({
+		promptAgent: async () => {
+			throw new HerdrError("agent_prompt_stalled", "prompt never observed as submitted");
+		},
+		waitAgent: async () => {
+			throw new HerdrError("timeout", "wait timed out");
+		},
+		getAgent: async () => fakeAgent("idle", run.agentName!),
+	});
+
+	// Root-cause regression (issue #1): an alive agent is NOT a submitted prompt,
+	// so delivery must reject instead of resolving successfully.
+	await assert.rejects(
+		deliverPanePrompt(run, "do the task", backend),
+		(err: unknown) =>
+			err instanceof PanePromptError &&
+			err.code === "pane_prompt_not_submitted" &&
+			err.message.includes(run.paneId!) &&
+			err.message.includes("composer"),
+	);
+	assert.strictEqual(run.sawWorking, undefined, "no evidence may be recorded for an unsubmitted prompt");
+});
+
+test("deliverPanePrompt accepts a live child observed working or done after the Enter retry", async () => {
+	// Issue #1 review (C4): `working` or `done` after the retry proves the child
+	// processed a turn — failing there would close the pane of a finished child.
+	for (const status of ["working", "done"] as const) {
+		const run = makePaneRun(`sa-dp-probe-${status}`);
+		const backend = paneBackend({
+			promptAgent: async () => {
+				throw new HerdrError("agent_prompt_stalled", "prompt never observed as submitted");
+			},
+			waitAgent: async () => {
+				throw new HerdrError("timeout", "wait timed out");
+			},
+			getAgent: async () => fakeAgent(status, run.agentName!),
+		});
+
+		await deliverPanePrompt(run, "do the task", backend);
+		assert.strictEqual(run.sawWorking, true, `an observed ${status} child records turn evidence`);
+	}
+});
+
+test("deliverPanePrompt accepts a live blocked child after the Enter retry without turn evidence", async () => {
+	const run = makePaneRun("sa-dp-probe-blocked");
+	const backend = paneBackend({
+		promptAgent: async () => {
+			throw new HerdrError("agent_prompt_stalled", "prompt never observed as submitted");
+		},
+		waitAgent: async () => {
+			throw new HerdrError("timeout", "wait timed out");
+		},
+		getAgent: async () => fakeAgent("blocked", run.agentName!),
+	});
+
+	await deliverPanePrompt(run, "do the task", backend);
+	assert.strictEqual(
+		run.sawWorking,
+		undefined,
+		"a blocked observation proves acceptance, not turn evidence",
+	);
+});
+
+test("deliverPanePrompt rethrows the original stall when the child is confirmed gone", async () => {
+	const run = makePaneRun("sa-dp-dead");
+	const backend = paneBackend({
+		promptAgent: async () => {
+			throw new HerdrError("agent_prompt_stalled", "prompt never observed as submitted");
+		},
+		waitAgent: async () => {
+			throw new HerdrError("timeout", "wait timed out");
+		},
+		getAgent: async () => null,
+	});
+
+	await assert.rejects(
+		deliverPanePrompt(run, "do the task", backend),
+		(err: unknown) => err instanceof HerdrError && err.code === "agent_prompt_stalled",
+	);
+});
+
+test("deliverPanePrompt propagates non-stall prompt errors without retrying", async () => {
+	const run = makePaneRun("sa-dp-notfound");
+	let sendKeysCalled = false;
+	const backend = paneBackend({
+		promptAgent: async () => {
+			throw new HerdrError("agent_not_found", "no such agent");
+		},
+		sendKeys: async () => {
+			sendKeysCalled = true;
+		},
+	});
+
+	await assert.rejects(
+		deliverPanePrompt(run, "do the task", backend),
+		(err: unknown) => err instanceof HerdrError && err.code === "agent_not_found",
+	);
+	assert.strictEqual(sendKeysCalled, false, "a non-stall error must not trigger the Enter retry");
 });
 
 test("childToolAllowlist appends the shared issue tools to persona allowlists", () => {

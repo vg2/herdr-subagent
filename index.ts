@@ -4,7 +4,8 @@
  * Phase 2 (Herdr pane mode + headless fallback):
  *   - `spawn_subagent`: dispatches one child process in an interactive Herdr pane
  *     (default inside Herdr TUI) or headless (fallback).
- *   - `collect_subagents`: waits for idle/done/blocked states and harvests reports
+ *   - `collect_subagents`: waits for blocked/done (first-turn evidence required) and
+ *     harvests reports
  *     from report files and session JSONL.
  *   - `subagent_status`: reports live states, usage, and harvested reports.
  *   - `abort_subagent`: ctrl+c then close pane (or kill headless), guarded against
@@ -42,7 +43,15 @@ import {
 	loadAdhocAgent,
 	THINKING_LEVELS,
 } from "./agents.ts";
-import { collectRuns, harvestReport, reconcileRuns } from "./collect.ts";
+import {
+	collectRuns,
+	harvestReport,
+	hasTurnEvidence,
+	reconcileRuns,
+	settlePaneAgentStatus,
+	STUCK_IDLE_GRACE_MS,
+	STUCK_STOP_REASON,
+} from "./collect.ts";
 import {
 	formatDuration,
 	formatLocation,
@@ -64,13 +73,14 @@ import {
 	listAgents,
 	listPanes,
 	listTabs,
-	promptAgent,
 } from "./herdr.ts";
 import { registerIssueTools } from "./issues.ts";
 import {
 	buildDelegationPrompt,
 	createRunDir,
+	deliverPanePrompt,
 	formatModelCatalog,
+	PanePromptError,
 	resolveModel,
 	resolveSpawnMode,
 	startHeadless,
@@ -337,14 +347,12 @@ const MessageParams = Type.Object({
 	message: Type.String({
 		description:
 			"Follow-up instruction for the child. It is delivered as a new user turn in the child's own context; " +
-			"use it for clarifications and corrections while the child is running or blocked.",
+			"use it for clarifications and corrections while the child is running or blocked. For an idle child " +
+			"(the spawn case) Herdr confirms the message was accepted; for a child that is already working or " +
+			"blocked the message is pasted into the pane and submitted with an encoded Enter, but acceptance " +
+			"is not individually confirmed — a stall (no observed state change) is retried with an explicit Enter " +
+			"and surfaced as a failure.",
 	}),
-	wait: Type.Optional(
-		Type.Boolean({
-			description: "Wait until Herdr confirms the child is working on the message. Default: true.",
-			default: true,
-		}),
-	),
 });
 
 // ---------------------------------------------------------------------------
@@ -449,7 +457,6 @@ export default function (pi: ExtensionAPI) {
 	const steerPaneChild = async (
 		run: SubagentRun,
 		message: string,
-		wait: boolean,
 	): Promise<{ ok: true } | { ok: false; error: string }> => {
 		if (run.mode !== "pane" || !run.agentName) {
 			return {
@@ -472,20 +479,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		try {
-			try {
-				await promptAgent(run.agentName, message, {
-					wait,
-					until: ["working", "blocked", "done"],
-					timeoutMs: 15000,
-				});
-			} catch (err: any) {
-				// A stalled/timed-out prompt is usually still delivered; only fail
-				// when the agent is confirmed gone.
-				const stalledOrTimeout = err?.code === "agent_prompt_stalled" || err?.code === "timeout";
-				if (!stalledOrTimeout) throw err;
-				const agent = await getAgent(run.agentName).catch(() => null);
-				if (!agent) throw err;
-			}
+			// The same delivery path as the spawn (issue #1): for an idle child herdr
+			// confirms acceptance; a stall (no observed state change) is retried with
+			// an explicit Enter and surfaced as a failure instead of silently
+			// assuming an alive agent received it.
+			await deliverPanePrompt(run, message);
 
 			run.status = "running";
 			run.endedAt = undefined;
@@ -496,7 +494,11 @@ export default function (pi: ExtensionAPI) {
 			pi.appendEntry("herdr-subagent-run", toView(run));
 			return { ok: true };
 		} catch (err: any) {
-			return { ok: false, error: `Failed to message ${run.id}: ${err?.message ?? String(err)}` };
+			const reason =
+				err instanceof PanePromptError
+					? `The message to ${run.id} was never observed as submitted (stall): ${err.message}`
+					: `Failed to message ${run.id}: ${err?.message ?? String(err)}`;
+			return { ok: false, error: reason };
 		}
 	};
 
@@ -520,35 +522,48 @@ export default function (pi: ExtensionAPI) {
 			if (!run.agentName) continue;
 			try {
 				const agent = await getAgent(run.agentName);
+				const before = run.status;
 				if (!agent) {
 					// Agent is confirmed gone (transient errors are rethrown by getAgent).
 					// Pane existence only decides whether a pane is still open to clean up.
 					const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
 					run.paneClosed = !paneAlive;
-					run.status = "done";
-					run.endedAt ??= Date.now();
-					await harvestReport(run);
-					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-				} else if (agent.agent_status === "blocked") {
-					const becameBlocked = run.status !== "blocked";
-					run.status = "blocked";
-					await harvestReport(run);
-					// Persist the pending question so a resumed session can surface it.
-					if (becameBlocked) pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-				} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-					run.status = "done";
-					run.endedAt ??= Date.now();
-					await harvestReport(run);
-					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
-				} else if (agent.agent_status === "working" && run.status === "blocked") {
+				}
+				// One completion-evidence rule (issue #1): `idle` alone never settles a
+				// pane run; a child that exited without ever processing a turn fails.
+				const settledOrBlocked = settlePaneAgentStatus(run, agent);
+				if (run.status === "running" && before === "blocked") {
 					// The user (or another process) answered the child in its pane:
 					// resume tracking so the next completion is harvested and notified.
-					run.status = "running";
-					run.endedAt = undefined;
 					run.notified = false;
 					run.collected = false;
 					run.blockedQuestion = undefined;
-					pi.appendEntry("herdr-subagent-run", toView(run));
+				}
+				if (run.status !== before) {
+					await harvestReport(run);
+					// Persist the transition (and, for `blocked`, the pending question)
+					// so a resumed session can surface it.
+					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
+				} else if (settledOrBlocked) {
+					// Still blocked: keep the surfaced question fresh (display-only), as
+					// before, without re-persisting an unchanged snapshot.
+					await harvestReport(run);
+				}
+				// Stuck-idle grace (issue #1): the child never began processing its
+				// task — the prompt was likely never submitted — so fail it instead of
+				// letting the parent silently wait out the full collect timeout.
+				if (
+					run.status === "running" &&
+					agent !== null &&
+					(agent.agent_status === "idle" || agent.agent_status === "done") &&
+					!hasTurnEvidence(run) &&
+					Date.now() - run.startedAt > STUCK_IDLE_GRACE_MS
+				) {
+					run.status = "failed";
+					run.stopReason = STUCK_STOP_REASON;
+					run.endedAt = Date.now();
+					await harvestReport(run);
+					pi.appendEntry("herdr-subagent-run", toView(run, { includeReport: true }));
 				}
 			} catch {
 				/* transient herdr error, keep run as-is */
@@ -868,6 +883,9 @@ export default function (pi: ExtensionAPI) {
 				} catch (err: any) {
 					run.status = "failed";
 					run.errorMessage = err.message || String(err);
+					// A stalled pane prompt means the task was never delivered: surface
+					// that explicitly (issue #1) instead of a generic spawn failure.
+					if (err instanceof PanePromptError) run.stopReason = err.code;
 					run.endedAt = Date.now();
 					refreshStatusWidget();
 					if (run.paneId && !run.paneClosed) {
@@ -1057,7 +1075,8 @@ export default function (pi: ExtensionAPI) {
 		name: "collect_subagents",
 		label: "Collect Sub-agents",
 		description:
-			"Wait for running sub-agents to settle (idle, done, or blocked) and harvest their reports. " +
+			"Wait for running sub-agents to settle (blocked, or done with first-turn evidence — an idle " +
+			"child that never began processing its task is failed after a 45s grace) and harvest their reports. " +
 			"Returns final markdown reports, token usage, and execution status. Blocked children return the pending " +
 			"question and how to answer (subagent_message); session-wide usage totals are appended. Reports are capped at 50 KB.",
 		parameters: CollectParams,
@@ -1179,24 +1198,25 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const agent = await getAgent(run.agentName);
 							if (!agent) {
+								// Agent is confirmed gone (transient errors are rethrown by
+								// getAgent); pane existence only decides cleanup tracking.
 								const paneAlive = run.paneId ? await isPaneAlive(run.paneId) : false;
 								run.paneClosed = !paneAlive;
-								if (run.status === "running" || run.status === "blocked") {
-									run.status = "done";
-									run.endedAt ??= Date.now();
+							}
+							// Only reconcile live runs: settling a finished run here could
+							// resurrect it to `running`/`blocked` without persisting the
+							// transition.
+							if (run.status === "running" || run.status === "blocked") {
+								// One completion-evidence rule (issue #1): `idle` alone never
+								// settles a pane run without first-turn evidence.
+								const before = run.status;
+								settlePaneAgentStatus(run, agent);
+								if (run.status === "running" && before === "blocked") {
+									// The child was answered in its pane and is working again.
+									run.notified = false;
+									run.collected = false;
+									run.blockedQuestion = undefined;
 								}
-							} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-								run.status = "done";
-								run.endedAt ??= Date.now();
-							} else if (agent.agent_status === "blocked") {
-								run.status = "blocked";
-							} else if (agent.agent_status === "working" && run.status === "blocked") {
-								// The child was answered in its pane and is working again.
-								run.status = "running";
-								run.endedAt = undefined;
-								run.notified = false;
-								run.collected = false;
-								run.blockedQuestion = undefined;
 							}
 						} catch {
 							/* transient error, keep status */
@@ -1383,7 +1403,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await steerPaneChild(run, params.message, params.wait ?? true);
+			const result = await steerPaneChild(run, params.message);
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: result.error }],
@@ -1564,7 +1584,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				const result = await steerPaneChild(run, messageText, true);
+				const result = await steerPaneChild(run, messageText);
 				if (!result.ok) {
 					ctx.ui.notify(result.error, "error");
 					return;

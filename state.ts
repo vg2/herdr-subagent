@@ -89,6 +89,8 @@ export interface SubagentRun {
 	sessionId?: string;
 	notified?: boolean;
 	paneClosed?: boolean;
+	/** True once herdr observed the child `working` (its first turn began processing). */
+	sawWorking?: boolean;
 
 	// Phase 3 worktree isolation
 	worktreePath?: string;
@@ -137,6 +139,8 @@ export interface RunView {
 	agentName?: string;
 	sessionId?: string;
 	paneClosed?: boolean;
+	/** True once herdr observed the child `working` (its first turn began processing). */
+	sawWorking?: boolean;
 
 	// Phase 3 worktree isolation
 	worktreePath?: string;
@@ -218,6 +222,7 @@ export function toView(run: SubagentRun, options: { includeReport?: boolean } = 
 		agentName: run.agentName,
 		sessionId: run.sessionId,
 		paneClosed: run.paneClosed,
+		sawWorking: run.sawWorking,
 		worktreePath: run.worktreePath,
 		worktreeBranch: run.worktreeBranch,
 		worktreeRepoRoot: run.worktreeRepoRoot,
@@ -413,6 +418,7 @@ function runFromView(view: RunView): SubagentRun {
 		agentName: view.agentName,
 		sessionId: view.sessionId,
 		paneClosed: view.paneClosed,
+		sawWorking: view.sawWorking,
 		worktreePath: view.worktreePath,
 		worktreeBranch: view.worktreeBranch,
 		worktreeRepoRoot: view.worktreeRepoRoot,
@@ -454,6 +460,7 @@ function mergeView(run: SubagentRun, view: RunView): void {
 	if (view.agentName !== undefined) run.agentName = view.agentName;
 	if (view.sessionId !== undefined) run.sessionId = view.sessionId;
 	if (view.paneClosed !== undefined) run.paneClosed = view.paneClosed;
+	if (view.sawWorking !== undefined) run.sawWorking = view.sawWorking;
 	if (view.worktreePath !== undefined) run.worktreePath = view.worktreePath;
 	if (view.worktreeBranch !== undefined) run.worktreeBranch = view.worktreeBranch;
 	if (view.worktreeRepoRoot !== undefined) run.worktreeRepoRoot = view.worktreeRepoRoot;

@@ -28,7 +28,6 @@ import {
 } from "./herdr.ts";
 import {
 	isSettled,
-	type RunStatus,
 	type SubagentRun,
 	type UsageStats,
 	wrapUntrustedReport,
@@ -310,6 +309,86 @@ export async function harvestReport(run: SubagentRun): Promise<void> {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Completion evidence (issue #1)
+// ---------------------------------------------------------------------------
+
+/** How long an evidence-free pane child may sit before the parent gives up on it. */
+export const STUCK_IDLE_GRACE_MS = 45000;
+/** Stop reason for a pane child that never began processing its task. */
+export const STUCK_STOP_REASON =
+	"pane child never began processing the task (no turn observed; the prompt may not have been submitted)";
+/** One `herdr agent wait` slice: the live state is probed after each slice. */
+const PANE_WAIT_SLICE_MS = 5000;
+
+/**
+ * The one completion-evidence rule for pane runs: a pane child that was never
+ * observed processing a turn — no `working` observation, no recorded turn, no
+ * disk report, no turn in its session JSONL — must never settle as `done` on
+ * an `idle` observation alone. A pre-task TUI is idle too, so a child whose
+ * prompt was never submitted would otherwise settle instantly with an empty
+ * report while it keeps running (issue #1).
+ */
+export function hasTurnEvidence(run: SubagentRun): boolean {
+	if (run.sawWorking === true) return true;
+	if (run.usage.turns >= 1) return true;
+	if (hasDiskReport(run)) return true;
+	if (run.sessionId) {
+		const sessionFile = findSessionFile(run.cwd, run.sessionId);
+		if (sessionFile) {
+			const session = parseSessionJsonl(sessionFile);
+			if (session && session.usage.turns >= 1) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Settle a pane run from an observed herdr agent state, applying the
+ * completion-evidence rule. Mutates `run` and returns whether it settled or
+ * blocked. `idle`/`done` without first-turn evidence leaves the run `running`
+ * (the caller applies the stuck-idle grace); `working` records the evidence.
+ */
+export function settlePaneAgentStatus(run: SubagentRun, agent: HerdrAgent | null): boolean {
+	if (agent === null) {
+		// Confirmed gone: it finished only if it ever processed a turn.
+		if (hasTurnEvidence(run)) {
+			run.status = "done";
+		} else {
+			run.status = "failed";
+			run.stopReason = "pane child exited without processing the task";
+		}
+		// Never re-stamp a finished run's completion time (durationMs would grow).
+		run.endedAt ??= Date.now();
+		return true;
+	}
+
+	switch (agent.agent_status) {
+		case "blocked":
+			run.status = "blocked";
+			return true;
+		case "working":
+			run.sawWorking = true;
+			run.status = "running";
+			run.endedAt = undefined;
+			return false;
+		case "idle":
+		case "done":
+			if (!hasTurnEvidence(run)) return false;
+			run.status = "done";
+			// Never re-stamp a finished run's completion time (durationMs would grow).
+			run.endedAt ??= Date.now();
+			return true;
+		default:
+			// "unknown" or an unrecognized observation: leave the run as-is.
+			return false;
+	}
+}
+
+function defaultSleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Wait for runs to settle, then harvest their reports and usage.
  */
@@ -317,8 +396,18 @@ export async function collectRuns(options: {
 	runs: SubagentRun[];
 	timeoutMs?: number;
 	pendingPromises?: Map<string, Promise<void>>;
+	/** Test seam: pane wait slice (defaults to herdr `waitAgent`). */
+	paneWait?: (agentName: string, opts: { until: string[]; timeoutMs: number }) => Promise<HerdrAgent | null>;
+	/** Test seam: pane state probe (defaults to herdr `getAgent`). */
+	paneGet?: (agentName: string) => Promise<HerdrAgent | null>;
+	/** Test seam: clock (defaults to `Date.now`). */
+	now?: () => number;
+	/** Test seam: sleep between no-change loop iterations (defaults to a real timeout). */
+	sleep?: (ms: number) => Promise<void>;
 }): Promise<SubagentRun[]> {
-	const { runs, timeoutMs = 300000, pendingPromises } = options;
+	const { runs, timeoutMs = 300000, pendingPromises, paneWait, paneGet } = options;
+	const nowFn = options.now ?? Date.now;
+	const sleepFn = options.sleep ?? defaultSleep;
 
 	const waitOne = async (run: SubagentRun): Promise<void> => {
 		if (isSettled(run.status)) {
@@ -341,38 +430,55 @@ export async function collectRuns(options: {
 					if (timer) clearTimeout(timer);
 				}
 			}
-		} else if (run.mode === "pane" && run.agentName && isHerdrAvailable()) {
-			try {
-				const agent = await waitAgent(run.agentName, {
-					until: ["idle", "done", "blocked"],
-					timeoutMs: timeoutMs > 0 ? timeoutMs : undefined,
-				});
+		} else if (
+			run.mode === "pane" &&
+			run.agentName &&
+			(paneWait !== undefined || paneGet !== undefined || isHerdrAvailable())
+		) {
+			const paneWaitFn = paneWait ?? waitAgent;
+			const paneGetFn = paneGet ?? getAgent;
+			const loopStart = nowFn();
 
-				if (agent) {
-					if (agent.agent_status === "blocked") {
-						run.status = "blocked";
-					} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-						run.status = "done";
-						run.endedAt = Date.now();
-					}
-				}
-			} catch (err: any) {
-				// If wait failed, check live agent state or process
+			// Slice loop (issue #1): `herdr agent wait` returns immediately when the
+			// agent is already in an `until` state, and an `idle` observation alone
+			// never settles a run — a pre-task TUI is idle too. Probe the live state
+			// after each slice and settle it through the one completion-evidence
+			// rule; an evidence-free idle child is failed by the stuck-idle grace
+			// instead of being collected as `done` with an empty report.
+			while (true) {
 				try {
-					const agent = await getAgent(run.agentName);
-					if (!agent) {
-						// Confirmed agent exited
-						run.status = "done";
-						run.endedAt = Date.now();
-					} else if (agent.agent_status === "blocked") {
-						run.status = "blocked";
-					} else if (agent.agent_status === "done" || agent.agent_status === "idle") {
-						run.status = "done";
-						run.endedAt = Date.now();
-					}
+					await paneWaitFn(run.agentName, {
+						until: ["idle", "done", "blocked"],
+						timeoutMs: PANE_WAIT_SLICE_MS,
+					});
 				} catch {
-					/* ignore transient error from getAgent */
+					/* slice timeout or transient failure: the probe below decides */
 				}
+
+				let probe: HerdrAgent | null | undefined;
+				try {
+					probe = await paneGetFn(run.agentName);
+				} catch {
+					probe = undefined; // transient probe failure: nothing settled this slice
+				}
+				if (probe !== undefined && settlePaneAgentStatus(run, probe)) break;
+
+				if (
+					run.status === "running" &&
+					!hasTurnEvidence(run) &&
+					nowFn() - run.startedAt > STUCK_IDLE_GRACE_MS
+				) {
+					run.status = "failed";
+					run.stopReason = STUCK_STOP_REASON;
+					run.endedAt = nowFn();
+					break;
+				}
+
+				// Long tasks may outlive the caller's budget: break leaving the run
+				// `running` (the child keeps working; collect again later).
+				if (timeoutMs > 0 && nowFn() - loopStart >= timeoutMs) break;
+
+				await sleepFn(1000);
 			}
 		}
 
@@ -389,20 +495,6 @@ export async function collectRuns(options: {
 // ---------------------------------------------------------------------------
 // Reconciliation after a parent restart (phase 4)
 // ---------------------------------------------------------------------------
-
-function statusFromHerdr(status: string, fallback: RunStatus): RunStatus {
-	switch (status) {
-		case "working":
-			return "running";
-		case "blocked":
-			return "blocked";
-		case "idle":
-		case "done":
-			return "done";
-		default:
-			return fallback;
-	}
-}
 
 /** Abort for a pane run restored from the session (its spawner closure is gone). */
 function restoredPaneAbort(run: SubagentRun): (reason?: string) => Promise<void> {
@@ -550,7 +642,10 @@ export async function reconcileRuns(options: ReconcileOptions): Promise<Reconcil
 			const liveName = agent.name || agent.agent;
 			if (liveName && run.agentName !== liveName) run.agentName = liveName;
 			run.abort = restoredPaneAbort(run);
-			run.status = statusFromHerdr(agent.agent_status, run.status);
+			// One completion-evidence rule (issue #1): an adopted `idle` child that
+			// never processed a turn stays running instead of being settled `done`;
+			// the poller applies the stuck-idle grace to it.
+			settlePaneAgentStatus(run, agent);
 			if (run.status === "running") {
 				run.endedAt = undefined;
 			} else if (!run.endedAt) {

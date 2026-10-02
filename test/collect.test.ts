@@ -11,31 +11,61 @@ import {
 	collectRuns,
 	extractBlockedQuestion,
 	reconcileRuns,
+	settlePaneAgentStatus,
+	STUCK_IDLE_GRACE_MS,
+	STUCK_STOP_REASON,
 } from "../collect.ts";
 import { emptyUsage, type SubagentRun } from "../state.ts";
 import { isHerdrAvailable, type HerdrAgent } from "../herdr.ts";
 
-test("findSessionFile locates session by cwd and sessionId", () => {
-	const cwd = process.cwd();
-	const baseDir = path.join(getAgentDir(), "sessions");
-	const slug = "--" + path.resolve(cwd).replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-") + "--";
-	const groupDir = path.join(baseDir, slug);
-	fs.mkdirSync(groupDir, { recursive: true });
-
-	const testId = "test-session-uuid-12345";
-	const testFile = path.join(groupDir, `2026-09-29T00-00-00-000Z_${testId}.jsonl`);
-	const header = JSON.stringify({ type: "session", version: 3, id: testId, cwd }) + "\n";
-	fs.writeFileSync(testFile, header, "utf-8");
-
+/**
+ * Run `fn` with `getAgentDir()` pointed at a throwaway dir so tests that write
+ * session JSONL never touch the real `~/.pi/agent`. Asserts the redirect up
+ * front — before anything is written — so a renamed env var fails the test
+ * instead of polluting the real agent dir.
+ */
+async function withTempAgentDir(fn: (agentDir: string) => Promise<void> | void): Promise<void> {
+	const envKey = "PI_CODING_AGENT_DIR";
+	const prev = process.env[envKey];
+	const tmpAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-agentdir-"));
+	process.env[envKey] = tmpAgentDir;
 	try {
-		const found = findSessionFile(cwd, testId);
-		assert.strictEqual(found, testFile);
-
-		const notFound = findSessionFile(cwd, "non-existent-session-id");
-		assert.strictEqual(notFound, null);
+		assert.strictEqual(
+			getAgentDir(),
+			tmpAgentDir,
+			`${envKey} must redirect getAgentDir() (env var renamed upstream?)`,
+		);
+		await fn(tmpAgentDir);
 	} finally {
-		if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+		if (prev === undefined) delete process.env[envKey];
+		else process.env[envKey] = prev;
+		fs.rmSync(tmpAgentDir, { recursive: true, force: true });
 	}
+}
+
+test("findSessionFile locates session by cwd and sessionId", async () => {
+	await withTempAgentDir((agentDir) => {
+		const cwd = process.cwd();
+		const baseDir = path.join(agentDir, "sessions");
+		const slug = "--" + path.resolve(cwd).replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-") + "--";
+		const groupDir = path.join(baseDir, slug);
+		fs.mkdirSync(groupDir, { recursive: true });
+
+		const testId = "test-session-uuid-12345";
+		const testFile = path.join(groupDir, `2026-09-29T00-00-00-000Z_${testId}.jsonl`);
+		const header = JSON.stringify({ type: "session", version: 3, id: testId, cwd }) + "\n";
+		fs.writeFileSync(testFile, header, "utf-8");
+
+		try {
+			const found = findSessionFile(cwd, testId);
+			assert.strictEqual(found, testFile);
+
+			const notFound = findSessionFile(cwd, "non-existent-session-id");
+			assert.strictEqual(notFound, null);
+		} finally {
+			if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+		}
+	});
 });
 
 test("parseSessionJsonl correctly extracts assistant message and usage", () => {
@@ -634,4 +664,318 @@ test("reconcileRuns adopts a live working agent and resumes tracking", async () 
 	assert.deepStrictEqual(summary.adopted, [run.id]);
 	assert.strictEqual(run.status, "running");
 	assert.strictEqual(run.endedAt, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Pane completion evidence + slice-loop waiting (issue #1)
+// ---------------------------------------------------------------------------
+
+function paneAgentOf(run: SubagentRun, status: string): HerdrAgent {
+	return {
+		agent: run.agentName!,
+		name: run.agentName,
+		agent_status: status,
+		pane_id: run.paneId ?? "%1",
+		tab_id: "tab-1",
+		workspace_id: "ws-1",
+	};
+}
+
+test("collectRuns fails an evidence-free idle pane child after the stuck-idle grace", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-stuck-"));
+	const run = makeRun({
+		id: "sa-collect-stuck",
+		status: "running",
+		dir: tmpDir,
+		reportPath: path.join(tmpDir, "report.md"),
+		sessionId: "collect-stuck-no-session-uuid",
+	});
+	const idle = paneAgentOf(run, "idle");
+
+	try {
+		const results = await collectRuns({
+			runs: [run],
+			timeoutMs: 300000,
+			paneWait: async () => idle,
+			paneGet: async () => idle,
+			now: () => run.startedAt + STUCK_IDLE_GRACE_MS + 1000,
+			sleep: async () => {},
+		});
+
+		assert.strictEqual(results[0], run);
+		assert.strictEqual(run.status, "failed", "an evidence-free idle child must not settle as done");
+		assert.strictEqual(run.stopReason, STUCK_STOP_REASON);
+		assert.strictEqual(
+			fs.existsSync(run.reportPath),
+			false,
+			"no report may be persisted for a child that never processed its task",
+		);
+		assert.strictEqual(run.collected, true);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("collectRuns settles an idle pane child that was observed working", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-sawworking-"));
+	const run = makeRun({
+		id: "sa-collect-sawworking",
+		status: "running",
+		sawWorking: true,
+		dir: tmpDir,
+		reportPath: path.join(tmpDir, "report.md"),
+		sessionId: "collect-sawworking-no-session-uuid",
+	});
+	const idle = paneAgentOf(run, "idle");
+
+	try {
+		await collectRuns({
+			runs: [run],
+			timeoutMs: 300000,
+			paneWait: async () => idle,
+			paneGet: async () => idle,
+			now: () => run.startedAt,
+			sleep: async () => {},
+		});
+
+		assert.strictEqual(run.status, "done");
+		assert.strictEqual(run.collected, true);
+		assert.strictEqual(run.endedAt !== undefined, true);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("collectRuns settles an idle pane child that wrote its report to disk", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-diskreport-"));
+	const reportPath = path.join(tmpDir, "report.md");
+	fs.writeFileSync(reportPath, "Final report from disk", "utf-8");
+	const run = makeRun({
+		id: "sa-collect-diskreport",
+		status: "running",
+		dir: tmpDir,
+		reportPath,
+		sessionId: "collect-diskreport-no-session-uuid",
+	});
+	const idle = paneAgentOf(run, "idle");
+
+	try {
+		await collectRuns({
+			runs: [run],
+			timeoutMs: 300000,
+			paneWait: async () => idle,
+			paneGet: async () => idle,
+			now: () => run.startedAt,
+			sleep: async () => {},
+		});
+
+		assert.strictEqual(run.status, "done");
+		assert.strictEqual(run.report, "Final report from disk");
+		assert.strictEqual(run.collected, true);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("collectRuns fails a gone pane child without evidence and finishes one with a disk report", async () => {
+	const parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-gone-"));
+
+	const stuck = makeRun({
+		id: "sa-collect-gone-stuck",
+		status: "running",
+		dir: parent,
+		reportPath: path.join(parent, "stuck-report.md"),
+		sessionId: "collect-gone-stuck-no-session-uuid",
+	});
+	const reportPath = path.join(parent, "finished-report.md");
+	fs.writeFileSync(reportPath, "Finished before the wait noticed", "utf-8");
+	const finished = makeRun({
+		id: "sa-collect-gone-finished",
+		status: "running",
+		dir: parent,
+		reportPath,
+		sessionId: "collect-gone-finished-no-session-uuid",
+	});
+
+	const waitThrows = async (): Promise<HerdrAgent | null> => {
+		throw new Error("slice timeout");
+	};
+
+	try {
+		await collectRuns({
+			runs: [stuck, finished],
+			timeoutMs: 300000,
+			paneWait: waitThrows,
+			paneGet: async () => null,
+			now: () => stuck.startedAt,
+			sleep: async () => {},
+		});
+
+		assert.strictEqual(stuck.status, "failed");
+		assert.strictEqual(stuck.stopReason, "pane child exited without processing the task");
+		assert.strictEqual(fs.existsSync(stuck.reportPath), false);
+
+		assert.strictEqual(finished.status, "done");
+		assert.strictEqual(finished.report, "Finished before the wait noticed");
+	} finally {
+		fs.rmSync(parent, { recursive: true, force: true });
+	}
+});
+
+test("collectRuns keeps waiting on a working pane child until the caller's timeout", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-working-"));
+	const run = makeRun({
+		id: "sa-collect-working",
+		status: "running",
+		dir: tmpDir,
+		reportPath: path.join(tmpDir, "report.md"),
+		sessionId: "collect-working-no-session-uuid",
+	});
+	const working = paneAgentOf(run, "working");
+
+	let clock = 0;
+	try {
+		await collectRuns({
+			runs: [run],
+			timeoutMs: 5000,
+			paneWait: async (): Promise<HerdrAgent | null> => {
+				throw new Error("slice timeout: still working");
+			},
+			paneGet: async () => working,
+			now: () => (clock += 6000),
+			sleep: async () => {},
+		});
+
+		assert.strictEqual(run.status, "running", "a working child outliving the budget stays running");
+		assert.strictEqual(run.collected, false);
+		assert.strictEqual(run.sawWorking, true, "the working observation is recorded as evidence");
+		assert.strictEqual(fs.existsSync(run.reportPath), false);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("collectRuns surfaces a blocked pane child's pending question", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-test-collect-blocked2-"));
+	const reportPath = path.join(tmpDir, "report.md");
+	const sessionId = "collect-blocked-uuid";
+	const run = makeRun({
+		id: "sa-collect-blocked",
+		status: "running",
+		dir: tmpDir,
+		reportPath,
+		sessionId,
+	});
+	const blocked = paneAgentOf(run, "blocked");
+
+	// A blocked child has turn evidence (it asked a question), so it settles.
+	// Hermetic: getAgentDir() points at a throwaway dir while the session JSONL
+	// is written and read, so nothing touches the real `~/.pi/agent`.
+	try {
+		await withTempAgentDir(async (agentDir) => {
+			const baseDir = path.join(agentDir, "sessions");
+			const slug = "--" + path.resolve(run.cwd).replace(/^[/\\]+/, "").replace(/[/\\:]/g, "-") + "--";
+			const groupDir = path.join(baseDir, slug);
+			fs.mkdirSync(groupDir, { recursive: true });
+			const sessionFile = path.join(groupDir, `2026-09-30T00-00-00-000Z_${sessionId}.jsonl`);
+			fs.writeFileSync(
+				sessionFile,
+				[
+					JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: run.cwd }),
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "Should I delete the stale build directory?" }],
+							usage: { input: 10, output: 5, cost: { total: 0.0001 }, totalTokens: 15 },
+						},
+					}),
+				].join("\n"),
+				"utf-8",
+			);
+
+			await collectRuns({
+				runs: [run],
+				timeoutMs: 300000,
+				paneWait: async () => blocked,
+				paneGet: async () => blocked,
+				now: () => run.startedAt,
+				sleep: async () => {},
+			});
+
+			assert.strictEqual(run.status, "blocked");
+			assert.strictEqual(run.usage.turns, 1);
+			assert.ok(run.blockedQuestion?.includes("stale build directory"));
+			assert.strictEqual(
+				fs.existsSync(reportPath),
+				false,
+				"a blocked child's pending prompt must stay display-only",
+			);
+			assert.strictEqual(run.collected, true);
+		});
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("reconcileRuns settles an adopted idle child only with first-turn evidence", async () => {
+	const finished = makeRun({
+		id: "sa-reconcile-idle-done",
+		status: "running",
+		usage: { ...emptyUsage(), turns: 3 },
+	});
+	const stuck = makeRun({ id: "sa-reconcile-idle-stuck", status: "running" });
+
+	const changed: string[] = [];
+	const summary = await reconcileRuns({
+		runs: [finished, stuck],
+		liveAgents: [paneAgentOf(finished, "idle"), paneAgentOf(stuck, "idle")],
+		paneAlive: async () => true,
+		onChange: (r) => changed.push(r.id),
+	});
+
+	assert.deepStrictEqual(summary.adopted, [finished.id, stuck.id]);
+	assert.strictEqual(finished.status, "done", "an adopted idle child with recorded turns finished");
+	assert.strictEqual(
+		stuck.status,
+		"running",
+		"an adopted idle child with no turn evidence stays running (stuck-idle grace applies)",
+	);
+	assert.deepStrictEqual(changed, [finished.id]);
+});
+
+test("settlePaneAgentStatus never re-stamps a finished run's endedAt", () => {
+	// Confirmed-gone arm (issue #1 review C2): an already-finished run keeps its
+	// original completion time instead of re-stamping it on every observation.
+	const gone = makeRun({
+		id: "sa-settle-gone",
+		status: "done",
+		endedAt: 111,
+		sawWorking: true,
+	});
+	settlePaneAgentStatus(gone, null);
+	assert.strictEqual(gone.status, "done");
+	assert.strictEqual(gone.endedAt, 111);
+
+	// Idle/done arm with evidence: same no-re-stamp rule.
+	const idle = makeRun({
+		id: "sa-settle-idle",
+		status: "done",
+		endedAt: 222,
+		sawWorking: true,
+	});
+	settlePaneAgentStatus(idle, paneAgentOf(idle, "idle"));
+	assert.strictEqual(idle.status, "done");
+	assert.strictEqual(idle.endedAt, 222);
+
+	// Working arm still clears endedAt (a blocked child resumed working).
+	const resumed = makeRun({
+		id: "sa-settle-resumed",
+		status: "blocked",
+		endedAt: 333,
+		sawWorking: true,
+	});
+	settlePaneAgentStatus(resumed, paneAgentOf(resumed, "working"));
+	assert.strictEqual(resumed.status, "running");
+	assert.strictEqual(resumed.endedAt, undefined);
 });

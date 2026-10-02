@@ -8,7 +8,7 @@ Each sub-agent runs as an independent `pi` process with its own context window, 
 
 ## Features
 
-- **Visible & Isolated Execution**: When inside Herdr TUI (`HERDR_ENV=1`), sub-agents spawn visibly in dedicated terminal panes or tabs. Ephemeral headless mode is used as an automatic fallback outside Herdr.
+- **Visible & Isolated Execution**: When inside Herdr TUI (`HERDR_ENV=1`), sub-agents spawn visibly in dedicated terminal panes or tabs. Ephemeral headless mode is used as an automatic fallback outside Herdr. Pane prompt delivery is confirmed — a spawn only succeeds once Herdr observed the child accept the task (a stalled submission is retried with an explicit Enter, then fails with `pane_prompt_not_submitted` instead of silently assuming an alive child received it) — and a pane run is only settled as `done` with first-turn evidence; an idle child that never began processing its task is failed after a 45 s grace rather than collected as `done` with an empty report.
 - **Topology & Layout Policy**: Automatically splits side-by-side or stacked based on terminal geometry for 1–2 sub-agents, opens dedicated tabs for larger batches, or isolates a writer in its own git worktree (`layout: "worktree"`).
 - **Strict Guarding**: Child processes are launched with `--no-extensions --no-skills -e guard.ts -e issues.ts` and a sanitized environment (`HERDR_ENV=0`) to prevent recursive delegation or bypass of the issue tracker.
 - **Selective Delegation**: Parent models receive delegation policy via tool descriptions and a `before_agent_start` guidelines section so they delegate only when isolated focus or parallelism provides clear leverage.
@@ -60,7 +60,7 @@ Delegates a self-contained task to an isolated sub-agent.
 
 ### `collect_subagents`
 
-Waits for running sub-agents to settle (`idle`, `done`, or `blocked`) and harvests reports and usage stats. Blocked children return their pending question plus how to answer it (`subagent_message`), and a session-wide usage totals line is appended.
+Waits for running sub-agents to settle (`blocked`, or `done` with first-turn evidence — an `idle` child that never began processing its task is failed after a 45 s grace, and a pane child that exits before processing any turn fails with stop reason `pane child exited without processing the task`) and harvests reports and usage stats. Blocked children return their pending question plus how to answer it (`subagent_message`), and a session-wide usage totals line is appended.
 
 - **Parameters**:
   - `ids` (optional): Specific run IDs to collect (defaults to all).
@@ -85,12 +85,11 @@ Aborts a running sub-agent. For Herdr pane children, sends `ctrl+c` and closes t
 
 ### `subagent_message`
 
-Sends a follow-up instruction to a running or blocked pane child. The child receives it as a new user turn in its own context; headless children cannot be steered.
+Sends a follow-up instruction to a running or blocked pane child. The child receives it as a new user turn in its own context; headless children cannot be steered. For an idle child Herdr confirms the message was accepted; for a child that is already working or blocked the message is pasted into the pane and submitted with an encoded Enter, but acceptance is not individually confirmed — a stall (no observed state change) is retried with an explicit Enter and surfaced as a failure. Check the child's pane or retry instead of assuming it arrived.
 
 - **Parameters**:
   - `id` (required): Run ID or agent name.
   - `message` (required): Follow-up instruction (clarifications, corrections, answers to a blocked prompt).
-  - `wait` (optional, default `true`): Wait until Herdr confirms the child is working on the message.
 
 ### `issue_create` / `issue_comment` / `issue_list` / `issue_get` / `issue_close`
 

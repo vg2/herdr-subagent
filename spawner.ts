@@ -34,6 +34,7 @@ import {
 	sendKeys,
 	splitPane,
 	startAgent,
+	waitAgent,
 } from "./herdr.ts";
 import { ISSUE_TOOL_NAMES } from "./issues.ts";
 import type { LayoutChoice, SpawnMode, SubagentRun } from "./state.ts";
@@ -593,6 +594,134 @@ export function resolveSpawnMode(
 	return { mode: "headless" };
 }
 
+// ---------------------------------------------------------------------------
+// Pane prompt delivery
+// ---------------------------------------------------------------------------
+
+/**
+ * A pane prompt was never observed as submitted: herdr's `agent prompt --wait`
+ * requires an observed `working` or `blocked` state within its wait window, so
+ * `agent_prompt_stalled` means the prompt was NOT accepted. An alive agent is
+ * not a submitted prompt, so delivery never resolves successfully on a stall.
+ */
+export class PanePromptError extends Error {
+	code = "pane_prompt_not_submitted";
+
+	constructor(message: string) {
+		super(message);
+		this.name = "PanePromptError";
+	}
+}
+
+/** Herdr agent operations used to deliver a prompt (injectable for tests). */
+export interface PanePromptBackend {
+	promptAgent: typeof promptAgent;
+	waitAgent: typeof waitAgent;
+	getAgent: typeof getAgent;
+	sendKeys: typeof sendKeys;
+}
+
+const DEFAULT_PANE_PROMPT_BACKEND: PanePromptBackend = {
+	promptAgent,
+	waitAgent,
+	getAgent,
+	sendKeys,
+};
+
+/** Pause before re-submitting a stalled prompt with an explicit Enter keypress. */
+const PROMPT_SUBMIT_RETRY_DELAY_MS = 500;
+/** How long to wait for the re-submitted prompt to be observed as accepted. */
+const PROMPT_SUBMIT_RETRY_TIMEOUT_MS = 10000;
+
+function isPromptStall(err: unknown): boolean {
+	return (
+		err instanceof HerdrError && (err.code === "agent_prompt_stalled" || err.code === "timeout")
+	);
+}
+
+/**
+ * Record first-turn evidence once herdr observes the child accepted the
+ * prompt. `working` and `done` both prove the child processed a turn;
+ * `blocked` proves acceptance (the child asked a question) without turn
+ * evidence of its own.
+ */
+function noteAccepted(run: SubagentRun, status: string): void {
+	if (status === "working" || status === "done") run.sawWorking = true;
+}
+
+/**
+ * Deliver a prompt to a pane child. When the submission starts from a
+ * non-working state (the spawn case), herdr confirms acceptance by observing
+ * `working`/`blocked`/`done` within its wait window; a target that is already
+ * working or blocked satisfies the wait immediately, so acceptance is not
+ * individually confirmed in that case. A stalled or timed-out submission is
+ * retried once with an explicit Enter keypress — the text may be sitting
+ * typed-but-unsubmitted in the child's composer. If the child still shows no
+ * sign of the prompt, the delivery fails: a confirmed-gone agent rethrows the
+ * original stall; an alive child that never began processing the prompt
+ * throws `PanePromptError`.
+ */
+export async function deliverPanePrompt(
+	run: SubagentRun,
+	text: string,
+	backend: PanePromptBackend = DEFAULT_PANE_PROMPT_BACKEND,
+): Promise<void> {
+	const name = run.agentName;
+	if (!name) {
+		throw new PanePromptError(`Pane prompt for ${run.id} has no agent name to address.`);
+	}
+
+	let stallError: unknown;
+	try {
+		const agent = await backend.promptAgent(name, text, {
+			wait: true,
+			until: ["working", "blocked", "done"],
+			timeoutMs: 15000,
+		});
+		noteAccepted(run, agent.agent_status);
+		return;
+	} catch (err) {
+		if (!isPromptStall(err)) throw err;
+		stallError = err;
+	}
+
+	// The submission was never observed: give the pane a moment, then press
+	// Enter to submit whatever is sitting in the child's composer.
+	await new Promise((resolve) => setTimeout(resolve, PROMPT_SUBMIT_RETRY_DELAY_MS));
+	await backend.sendKeys(name, "enter");
+
+	try {
+		const agent = await backend.waitAgent(name, {
+				until: ["working", "blocked", "done"],
+				timeoutMs: PROMPT_SUBMIT_RETRY_TIMEOUT_MS,
+			});
+		noteAccepted(run, agent.agent_status);
+		return;
+	} catch (err) {
+		if (!isPromptStall(err)) throw err;
+	}
+
+	// Still never observed. A gone agent rethrows the original stall. For a live
+	// child, `working` or `done` proves the prompt was submitted (the child
+	// processed a turn — issue #1: failing it there would close the pane of a
+	// child that finished); `blocked` proves acceptance without turn evidence;
+	// only `idle`/`unknown` means the task text was never submitted.
+	const agent = await backend.getAgent(name).catch(() => null);
+	if (!agent) throw stallError;
+	if (agent.agent_status === "working" || agent.agent_status === "done") {
+		run.sawWorking = true;
+		return;
+	}
+	if (agent.agent_status === "blocked") {
+		return;
+	}
+	throw new PanePromptError(
+		`Pane prompt for ${run.id} was never observed as submitted: agent ${name} in pane ` +
+			`${run.paneId ?? "(unknown)"} is alive but ${agent.agent_status}, so the task text may ` +
+			`still be sitting unsubmitted in the child's composer.`,
+	);
+}
+
 export interface PaneSpawnOptions {
 	run: SubagentRun;
 	persona: AgentConfig;
@@ -744,27 +873,9 @@ export async function startPane(options: PaneSpawnOptions): Promise<void> {
 			args,
 		});
 
-		try {
-			await promptAgent(run.agentName, delegationPrompt, {
-				wait: true,
-				until: ["working", "done", "idle"],
-				timeoutMs: 15000,
-			});
-		} catch (promptErr: any) {
-			// If prompt_stalled or timeout occurred, check if the agent is still running.
-			// If alive in Herdr, the prompt was accepted and the child is running.
-			const isStalledOrTimeout =
-				promptErr instanceof HerdrError &&
-				(promptErr.code === "agent_prompt_stalled" || promptErr.code === "timeout");
-			if (isStalledOrTimeout) {
-				const agent = await getAgent(run.agentName).catch(() => null);
-				if (agent) {
-					// Agent is alive and received the prompt; do not abort/fail the spawn
-					return;
-				}
-			}
-			throw promptErr;
-		}
+		// The only prompt-delivery path: never resolves successfully on a stall —
+		// a `PanePromptError` flows into the cleanup below (pane closed, spawn failed).
+		await deliverPanePrompt(run, delegationPrompt);
 	} catch (err) {
 		// Clean up created pane so we don't leak orphaned panes
 		if (run.paneId && !run.paneClosed) {

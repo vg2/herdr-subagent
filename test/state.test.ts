@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert";
-import { RunRegistry, reconstructRuns, sumUsage, type RunView, type UsageStats } from "../state.ts";
+import {
+	RunRegistry,
+	reconstructRuns,
+	sumUsage,
+	toView,
+	type RunView,
+	type UsageStats,
+} from "../state.ts";
 
 function usage(partial: Partial<UsageStats> = {}): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0, ...partial };
@@ -134,6 +141,29 @@ test("sumUsage totals turns/tokens/cost and takes the max context size", () => {
 	assert.strictEqual(total.cacheWrite, 3);
 	assert.strictEqual(Math.round(total.cost * 100), 3);
 	assert.strictEqual(total.contextTokens, 4000);
+});
+
+test("sawWorking survives the snapshot round-trip and old snapshots still reconstruct", () => {
+	// toView carries the evidence flag, and reconstructRuns restores it.
+	const [observed] = reconstructRuns([
+		entry(view({ id: "sa-wk-1", startedAt: 1, status: "running", sawWorking: true })),
+	]);
+	assert.strictEqual(observed.sawWorking, true);
+	const [roundTripped] = reconstructRuns([entry(toView(observed))]);
+	assert.strictEqual(roundTripped.sawWorking, true, "toView must carry sawWorking");
+
+	// A later snapshot without the field keeps the earlier observation (mergeView).
+	const [merged] = reconstructRuns([
+		entry(view({ id: "sa-wk-1", startedAt: 1, status: "running", sawWorking: true })),
+		entry(view({ id: "sa-wk-1", startedAt: 1, status: "done", endedAt: 2 })),
+	]);
+	assert.strictEqual(merged.sawWorking, true);
+
+	// Old snapshots without the field still reconstruct (additive, optional).
+	const [legacy] = reconstructRuns([
+		entry(view({ id: "sa-wk-2", startedAt: 1, status: "done", endedAt: 2 })),
+	]);
+	assert.strictEqual(legacy.sawWorking, undefined);
 });
 
 test("RunRegistry.restore replaces state and keeps new ids from colliding", () => {
