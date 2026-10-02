@@ -24,6 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -602,6 +603,13 @@ export default function (pi: ExtensionAPI) {
 			/* reconciliation is best-effort: never block session startup */
 		}
 	};
+
+	// Ship the usage skill with the extension: `resources_discover` makes the bundled
+	// skill available whenever this extension loads, regardless of install path.
+	pi.on("resources_discover", () => {
+		const extensionDir = path.dirname(fileURLToPath(import.meta.url));
+		return { skillPaths: [path.join(extensionDir, "skills")] };
+	});
 
 	// Phase 3 (Plan item 12): inject the delegation policy as prompt guidelines so
 	// the model delegates by policy instead of eagerness.

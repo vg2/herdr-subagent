@@ -17,6 +17,7 @@ Each sub-agent runs as an independent `pi` process with its own context window, 
 - **Resume-Safe**: On session resume the extension rebuilds its child registry from the session branch and reconciles it against live Herdr agents: still-running pane children are re-adopted (with abort/collection wired back up — matched by agent name, falling back to pane id), children that finished before the restart are settled from their persisted reports, children that died mid-flight are failed with their partial text clearly marked as possibly incomplete (never persisted as a final report), a child abandoned in a live but untracked pane is surfaced rather than silently dropped, and worktree/workspace ownership survives the restart so `/subagents cleanup` still works.
 - **Usage Accounting**: Per-child token/cache/cost totals are harvested from child session JSONL, and `subagent_status`, `collect_subagents`, and `/subagents list` append a session-wide totals line (turns, tokens, cache, cost, max context).
 - **Bundled Personas**: Includes starter personas (`scout`, `planner`, `worker`, `reviewer`) with model and thinking-level defaults.
+- **Bundled Skill**: Ships a `herdr-subagents` skill that teaches the parent model delegation policy, brief-writing, layout/model selection, and issue-board coordination. It is registered by the extension via `resources_discover`, so it loads wherever the extension loads and can be forced with `/skill:herdr-subagents`.
 - **Fire-and-Forget or Synchronous**: Dispatch tasks in the background and harvest later with `collect_subagents` or `subagent_status`, or block inline with `wait=true`.
 - **Interactive Control**: Manage and watch children live using the `/subagents` command (`list`, `focus`, `answer`, `abort`, `collect`, `cleanup`).
 
@@ -122,6 +123,18 @@ User-facing command to inspect and control sub-agents:
 | `reviewer` | Strict code review for correctness & security     | `opencode-go/glm-5.3`       | `high`            |
 
 Custom user personas can be added in `~/.pi/agent/agents/*.md` or project-local `.pi/agents/*.md`.
+
+---
+
+## Bundled Skill
+
+The extension ships `skills/herdr-subagents/SKILL.md`, declared in the package manifest (`pi.skills`) and
+registered from `index.ts` via the `resources_discover` event. The parent model sees its name and
+description at session start and loads the full instructions when delegation work matches; the user can
+force it with `/skill:herdr-subagents`.
+
+Sub-agents are spawned with `--no-skills`, so they never load it — their guidance is the delegation prompt
+plus the `guard`/`issues` extensions.
 
 ---
 
