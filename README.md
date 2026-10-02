@@ -41,7 +41,9 @@ pi update herdr-subagent
 ## Tools Exposed
 
 ### `spawn_subagent`
+
 Delegates a self-contained task to an isolated sub-agent.
+
 - **Parameters**:
   - `task` (required): What the sub-agent owns (imperative, single job).
   - `agent` (optional): Persona name (`scout`, `planner`, `worker`, `reviewer`).
@@ -56,32 +58,41 @@ Delegates a self-contained task to an isolated sub-agent.
   - `wait` (optional, default `false`): Whether to block until completion or dispatch in background.
 
 ### `collect_subagents`
+
 Waits for running sub-agents to settle (`idle`, `done`, or `blocked`) and harvests reports and usage stats. Blocked children return their pending question plus how to answer it (`subagent_message`), and a session-wide usage totals line is appended.
+
 - **Parameters**:
   - `ids` (optional): Specific run IDs to collect (defaults to all).
   - `timeoutMs` (optional, default `300000`): Maximum time to wait.
 
 ### `subagent_status`
+
 Queries the live state of spawned sub-agents and harvests reports from completed runs. Blocked children show the pending question and answer hint; a session-wide usage totals line is appended.
+
 - **Parameters**:
   - `ids` (optional): Specific run IDs to check.
   - `wait` (optional, default `false`): Block until running sub-agents settle.
   - `timeoutMs` (optional): Timeout when blocking.
 
 ### `abort_subagent`
+
 Aborts a running sub-agent. For Herdr pane children, sends `ctrl+c` and closes the pane.
+
 - **Parameters**:
   - `id` (required): Run ID or agent name.
   - `force` (optional, default `false`): Force abort even if child is currently working or blocked waiting for input.
 
 ### `subagent_message`
+
 Sends a follow-up instruction to a running or blocked pane child. The child receives it as a new user turn in its own context; headless children cannot be steered.
+
 - **Parameters**:
   - `id` (required): Run ID or agent name.
   - `message` (required): Follow-up instruction (clarifications, corrections, answers to a blocked prompt).
   - `wait` (optional, default `true`): Wait until Herdr confirms the child is working on the message.
 
 ### `issue_create` / `issue_comment` / `issue_list` / `issue_get` / `issue_close`
+
 The shared cross-agent issue board. Uses `gh issue ...` when the project is a GitHub checkout with `gh` available; otherwise a durable file board at `<project>/.pi/issues/` (markdown + YAML frontmatter). The board always resolves to the main checkout, so worktree-isolated children share it. Titles follow `[<agent>] <summary>` (prefixed automatically), and status transitions (`open → in-progress → blocked → done`) are recorded with `issue_comment`/`issue_close`: on GitHub a closed issue carries no stale `status:*` labels (the closed/open state itself represents done/open, reopening follows the transition), and `issue_create` with `status: "done"` closes the issue. Missing labels are created on demand (if they cannot be applied the issue is still created and the skip is reported), and agent-shaped assignees (e.g. `scout`) are reported as skipped on GitHub since assignees there must be GitHub logins.
 
 ---
@@ -89,7 +100,9 @@ The shared cross-agent issue board. Uses `gh issue ...` when the project is a Gi
 ## User Commands
 
 ### `/subagents`
+
 User-facing command to inspect and control sub-agents:
+
 - `/subagents` / `/subagents list`: View all tracked sub-agents, live states, locations, and usage.
 - `/subagents focus <id>`: Switch focus to a child's Herdr pane or tab (blocked children include an answer hint).
 - `/subagents answer <id> <text>`: Relay an answer to a running or blocked pane child without leaving the parent pane — the same delivery path as `subagent_message`.
@@ -101,23 +114,14 @@ User-facing command to inspect and control sub-agents:
 
 ## Starter Personas
 
-| Persona | Purpose | Default Model Pin | Default Thinking |
-|---|---|---|---|
-| `scout` | Fast, read-only codebase exploration & recon | `opencode-go/glm-5.3-flash` | `low` |
-| `planner` | Formulates actionable implementation plans | `opencode-go/glm-5.3` | `high` |
-| `worker` | General-purpose autonomous coding with full tools | Parent's active model | Parent's thinking |
-| `reviewer` | Strict code review for correctness & security | `opencode-go/glm-5.3` | `high` |
+| Persona    | Purpose                                           | Default Model Pin           | Default Thinking  |
+| ---------- | ------------------------------------------------- | --------------------------- | ----------------- |
+| `scout`    | Fast, read-only codebase exploration & recon      | `opencode-go/glm-5.3-flash` | `low`             |
+| `planner`  | Formulates actionable implementation plans        | `opencode-go/glm-5.3`       | `high`            |
+| `worker`   | General-purpose autonomous coding with full tools | Parent's active model       | Parent's thinking |
+| `reviewer` | Strict code review for correctness & security     | `opencode-go/glm-5.3`       | `high`            |
 
 Custom user personas can be added in `~/.pi/agent/agents/*.md` or project-local `.pi/agents/*.md`.
-
----
-
-## Roadmap
-
-- **Phase 1 (Complete)**: Headless MVP, dual-mode execution foundation, starter personas, and hard isolation guard.
-- **Phase 2 (Complete)**: Interactive Herdr pane integration (`HERDR_ENV=1`), layout topologies (panes, tabs), background watcher, `/subagents` command, `collect_subagents` and `abort_subagent` tools.
-- **Phase 3 (Complete)**: Issue tracker communication channel (`gh` / file-backed board), `subagent_message` steering, footer status widget, worktree isolation for parallel writers, and policy-based delegation guidelines injected via `before_agent_start`.
-- **Phase 4 (Complete)**: Hardening — blocked-child UX (pending question surfaced in status/collect/list, `/subagents answer` relay, poller resumes tracking a child answered in its pane), resume-time reconciliation (rebuild the registry from the session branch, re-adopt live Herdr agents, settle stale runs, restore worktree/workspace ownership), and cross-child usage accounting (session-JSONL totals plus a session-wide totals line).
 
 ---
 
